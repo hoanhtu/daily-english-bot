@@ -3,19 +3,17 @@ const TelegramBot = require('node-telegram-bot-api');
 const cron = require('node-cron');
 const moment = require('moment-timezone');
 const DatabaseManager = require('./database');
+const http = require('http');
 
 // Configuration
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Saigon';
+const PORT = process.env.PORT || 10000;
 
 if (!TOKEN) {
   console.error('ERROR: TELEGRAM_BOT_TOKEN is not set in .env file!');
   process.exit(1);
-}
-
-if (ADMIN_IDS.length === 0) {
-  console.warn('WARNING: No ADMIN_IDS configured. Admin commands will not work.');
 }
 
 // Helper functions
@@ -34,13 +32,13 @@ function getDeadlineTime() {
 }
 
 function formatUserDisplay(user) {
+  if (!user) return 'Unknown';
   if (user.first_name || user.last_name) {
     return `${user.first_name || ''} ${user.last_name || ''}`.trim() + (user.username ? ` (@${user.username})` : '');
   }
   return user.username ? `@${user.username}` : `User #${user.telegram_id}`;
 }
 
-// Check if submission is valid (at least 3 minutes audio/video)
 function validateSubmission(msg) {
   const voice = msg.voice;
   const video = msg.video;
@@ -92,6 +90,16 @@ function validateSubmission(msg) {
   return { valid: false, reason: 'no_media' };
 }
 
+// Create HTTP server for Render health checks
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Daily English Bot is running!\n');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 Health check server listening on port ${PORT}`);
+});
+
 async function startBot() {
   const db = new DatabaseManager();
   await db.ready;
@@ -105,16 +113,17 @@ async function startBot() {
   // ===== COMMAND HANDLERS =====
 
   // Start command
-  bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const username = msg.from.username || null;
-    const firstName = msg.from.first_name || null;
-    const lastName = msg.from.last_name || null;
+  bot.onText(/\/start/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+      const username = msg.from.username || null;
+      const firstName = msg.from.first_name || null;
+      const lastName = msg.from.last_name || null;
 
-    db.registerUser(userId, username, firstName, lastName);
+      await db.registerUser(userId, username, firstName, lastName);
 
-    const welcomeMsg = `
+      const welcomeMsg = `
 🎯 *Daily English Bot* 🎯
 
 Welcome ${firstName || 'there'}! I'm here to help you track your daily English practice.
@@ -140,20 +149,28 @@ Welcome ${firstName || 'there'}! I'm here to help you track your daily English p
 Let's practice English every day! 🚀
 `;
 
-    bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /start:', err.message);
+    }
   });
 
   // Get my Telegram ID
-  bot.onText(/\/myid/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    bot.sendMessage(chatId, `🆔 Your Telegram User ID: \`${userId}\``, { parse_mode: 'Markdown' });
+  bot.onText(/\/myid/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+      await bot.sendMessage(chatId, `🆔 Your Telegram User ID: \`${userId}\``, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /myid:', err.message);
+    }
   });
 
   // Submit instructions
-  bot.onText(/\/submit/, (msg) => {
-    const chatId = msg.chat.id;
-    bot.sendMessage(chatId, `
+  bot.onText(/\/submit/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      await bot.sendMessage(chatId, `
 🎤 *How to Submit Your Daily Recording*
 
 Simply *send a voice message, video, or audio file* in this chat!
@@ -172,22 +189,26 @@ Simply *send a voice message, video, or audio file* in this chat!
 
 Send your recording now! 🚀
 `, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /submit:', err.message);
+    }
   });
 
   // My Stats
-  bot.onText(/\/mystats/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/mystats/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    db.registerUser(userId, msg.from.username, msg.from.first_name, msg.from.last_name);
-    const stats = db.getUserStats(userId);
-    const user = db.getUser(userId);
+      await db.registerUser(userId, msg.from.username, msg.from.first_name, msg.from.last_name);
+      const stats = await db.getUserStats(userId);
+      const user = await db.getUser(userId);
 
-    const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
-    const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
-    const monthSubmissions = db.getSubmissionsInRange(userId, startOfMonth, endOfMonth);
+      const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
+      const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
+      const monthSubmissions = await db.getSubmissionsInRange(userId, startOfMonth, endOfMonth);
 
-    const statsMsg = `
+      const statsMsg = `
 📊 *Your Statistics* 📊
 
 👤 *${formatUserDisplay(user)}*
@@ -201,104 +222,117 @@ ${stats.lastSubmission ? `\n✅ Last submission: \`${stats.lastSubmission}\`` : 
 Keep up the great work! 💪
 `;
 
-    bot.sendMessage(chatId, statsMsg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, statsMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /mystats:', err.message);
+    }
   });
 
   // Streak
-  bot.onText(/\/streak/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/streak/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    const streak = db.calculateStreak(userId);
+      const streak = await db.calculateStreak(userId);
 
-    let message = '';
-    if (streak === 0) {
-      message = `You don't have an active streak yet. Submit your first recording today! 🎤`;
-    } else if (streak === 1) {
-      message = `🔥 You have a 1-day streak! Keep going! Day 2 awaits!`;
-    } else if (streak < 7) {
-      message = `🔥 *${streak}-day streak!* You're building a great habit! Keep it up!`;
-    } else if (streak < 30) {
-      message = `🔥🔥 *${streak}-day streak!* Amazing consistency! You're on fire!`;
-    } else {
-      message = `🔥🔥🔥 *${streak}-day streak!* INCREDIBLE! You're a true champion! 🏆`;
+      let message = '';
+      if (streak === 0) {
+        message = `You don't have an active streak yet. Submit your first recording today! 🎤`;
+      } else if (streak === 1) {
+        message = `🔥 You have a 1-day streak! Keep going! Day 2 awaits!`;
+      } else if (streak < 7) {
+        message = `🔥 *${streak}-day streak!* You're building a great habit! Keep it up!`;
+      } else if (streak < 30) {
+        message = `🔥🔥 *${streak}-day streak!* Amazing consistency! You're on fire!`;
+      } else {
+        message = `🔥🔥🔥 *${streak}-day streak!* INCREDIBLE! You're a true champion! 🏆`;
+      }
+
+      await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /streak:', err.message);
     }
-
-    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   });
 
   // History
-  bot.onText(/\/history/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/history/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    const submissions = db.getUserSubmissions(userId, 15);
+      const submissions = await db.getUserSubmissions(userId, 15);
 
-    if (submissions.length === 0) {
-      bot.sendMessage(chatId, '📭 No submissions found. Start by sending your first recording!');
-      return;
+      if (submissions.length === 0) {
+        await bot.sendMessage(chatId, '📭 No submissions found. Start by sending your first recording!');
+        return;
+      }
+
+      let historyMsg = `📋 *Your Recent Submissions*\n\n`;
+      submissions.forEach((sub, index) => {
+        const date = moment(sub.submission_date).format('MMM D, YYYY');
+        const time = sub.submitted_at ? moment(sub.submitted_at).format('HH:mm') : '--:--';
+        const duration = sub.duration > 0 ? `${Math.floor(sub.duration / 60)}m ${sub.duration % 60}s` : 'N/A';
+        const type = sub.file_type === 'voice' ? '🎤' : sub.file_type === 'video' ? '📹' : '🎵';
+        historyMsg += `${index + 1}. ${type} ${date} at ${time} (${duration})\n`;
+      });
+
+      await bot.sendMessage(chatId, historyMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /history:', err.message);
     }
-
-    let historyMsg = `📋 *Your Recent Submissions*\n\n`;
-    submissions.forEach((sub, index) => {
-      const date = moment(sub.submission_date).format('MMM D, YYYY');
-      const time = sub.submitted_at ? moment(sub.submitted_at).format('HH:mm') : '--:--';
-      const duration = sub.duration > 0 ? `${Math.floor(sub.duration / 60)}m ${sub.duration % 60}s` : 'N/A';
-      const type = sub.file_type === 'voice' ? '🎤' : sub.file_type === 'video' ? '📹' : '🎵';
-      historyMsg += `${index + 1}. ${type} ${date} at ${time} (${duration})\n`;
-    });
-
-    bot.sendMessage(chatId, historyMsg, { parse_mode: 'Markdown' });
   });
 
   // Leaderboard
-  bot.onText(/\/leaderboard/, (m) => {
-    const chatId = m.chat.id;
-    const users = db.getAllActiveUsers();
-    const today = getToday();
-    const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
-    const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
+  bot.onText(/\/leaderboard/, async (m) => {
+    try {
+      const chatId = m.chat.id;
+      const users = await db.getAllActiveUsers();
+      const today = getToday();
+      const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
+      const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
 
-    const userStats = users.map(user => {
-      const monthSubs = db.getSubmissionsInRange(user.telegram_id, startOfMonth, endOfMonth);
-      const streak = db.calculateStreak(user.telegram_id);
-      return {
-        ...user,
-        monthCount: monthSubs.length,
-        streak
-      };
-    });
+      const userStats = [];
+      for (const user of users) {
+        const monthSubs = await db.getSubmissionsInRange(user.telegram_id, startOfMonth, endOfMonth);
+        const streak = await db.calculateStreak(user.telegram_id);
+        userStats.push({ ...user, monthCount: monthSubs.length, streak });
+      }
 
-    userStats.sort((a, b) => b.monthCount - a.monthCount || b.streak - a.streak);
+      userStats.sort((a, b) => b.monthCount - a.monthCount || b.streak - a.streak);
 
-    const todaySubmissions = db.getTodaySubmissions(today);
+      const todaySubmissions = await db.getTodaySubmissions(today);
 
-    let leaderboardMsg = `🏆 *Leaderboard - ${moment().tz(TIMEZONE).format('MMMM YYYY')}* 🏆\n\n`;
-    leaderboardMsg += `📅 Today: ${todaySubmissions.length}/${users.length} submitted\n\n`;
+      let leaderboardMsg = `🏆 *Leaderboard - ${moment().tz(TIMEZONE).format('MMMM YYYY')}* 🏆\n\n`;
+      leaderboardMsg += `📅 Today: ${todaySubmissions.length}/${users.length} submitted\n\n`;
 
-    const medals = ['🥇', '🥈', '🥉'];
-    userStats.forEach((user, index) => {
-      const rank = index < 3 ? medals[index] : `${index + 1}.`;
-      const name = user.first_name || user.username || `User ${user.telegram_id}`;
-      let line = `${rank} *${name}* - ${user.monthCount} this month`;
-      if (user.streak > 0) line += ` 🔥${user.streak}d`;
-      if (index === 0 && user.monthCount > 0) line += ' 👑';
-      leaderboardMsg += `${line}\n`;
-    });
+      const medals = ['🥇', '🥈', '🥉'];
+      userStats.forEach((user, index) => {
+        const rank = index < 3 ? medals[index] : `${index + 1}.`;
+        const name = user.first_name || user.username || `User ${user.telegram_id}`;
+        let line = `${rank} *${name}* - ${user.monthCount} this month`;
+        if (user.streak > 0) line += ` 🔥${user.streak}d`;
+        if (index === 0 && user.monthCount > 0) line += ' 👑';
+        leaderboardMsg += `${line}\n`;
+      });
 
-    if (userStats.length === 0) {
-      leaderboardMsg += '\nNo registered users yet!';
+      if (userStats.length === 0) {
+        leaderboardMsg += '\nNo registered users yet!';
+      }
+
+      await bot.sendMessage(chatId, leaderboardMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /leaderboard:', err.message);
     }
-
-    bot.sendMessage(chatId, leaderboardMsg, { parse_mode: 'Markdown' });
   });
 
   // Help
-  bot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/help/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    let helpMsg = `
+      let helpMsg = `
 📚 *Available Commands*
 
 *For everyone:*
@@ -326,22 +360,26 @@ Just send a voice message, video, or audio file of at least 3 minutes!
 *Deadline:* ${getDeadlineTime()} daily
 `;
 
-    bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /help:', err.message);
+    }
   });
 
   // ===== ADMIN COMMANDS =====
 
   // Admin panel
-  bot.onText(/\/admin/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/admin/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    if (!isAdmin(userId)) {
-      bot.sendMessage(chatId, '⛔ You are not authorized to use admin commands.');
-      return;
-    }
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ You are not authorized to use admin commands.');
+        return;
+      }
 
-    const adminMsg = `
+      const adminMsg = `
 🔧 *Admin Panel*
 
 /status 📊 - Today's submission status
@@ -352,307 +390,354 @@ Just send a voice message, video, or audio file of at least 3 minutes!
 /setdeadline ⏰ - Set deadline (HH:MM format)
 `;
 
-    bot.sendMessage(chatId, adminMsg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, adminMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /admin:', err.message);
+    }
   });
 
   // Today's status (admin)
-  bot.onText(/\/status/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/status/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
-
-    const today = getToday();
-    const usersStatus = db.getAllUsersWithTodayStatus(today);
-
-    const submitted = usersStatus.filter(u => u.submission_id);
-    const notSubmitted = usersStatus.filter(u => !u.submission_id);
-
-    let statusMsg = `📊 *Today's Status - ${today}*\n\n`;
-    statusMsg += `✅ Submitted: *${submitted.length}/${usersStatus.length}*\n`;
-    statusMsg += `❌ Missing: *${notSubmitted.length}/${usersStatus.length}*\n\n`;
-
-    if (submitted.length > 0) {
-      statusMsg += `*✅ Submitted:*\n`;
-      submitted.forEach(u => {
-        const name = u.first_name || u.username || `User ${u.telegram_id}`;
-        const time = u.submitted_at ? moment(u.submitted_at).format('HH:mm') : '--:--';
-        const duration = u.duration > 0 ? `(${Math.floor(u.duration / 60)}m ${u.duration % 60}s)` : '';
-        const type = u.file_type === 'voice' ? '🎤' : u.file_type === 'video' ? '📹' : '🎵';
-        statusMsg += `${type} ${name} - ${time} ${duration}\n`;
-      });
-      statusMsg += '\n';
-    }
-
-    if (notSubmitted.length > 0) {
-      statusMsg += `*❌ Not Submitted:*\n`;
-      notSubmitted.forEach(u => {
-        const name = u.first_name || u.username || `User ${u.telegram_id}`;
-        statusMsg += `• ${name}\n`;
-      });
-    }
-
-    bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
-  });
-
-  // Full report
-  bot.onText(/\/report/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
-
-    const today = getToday();
-    const usersStatus = db.getAllUsersWithTodayStatus(today);
-    const allUsers = db.getAllActiveUsers();
-
-    const submitted = usersStatus.filter(u => u.submission_id);
-    const notSubmitted = usersStatus.filter(u => !u.submission_id);
-
-    const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
-    const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
-    const daysInMonth = moment().tz(TIMEZONE).date();
-
-    let reportMsg = `📋 *Daily Report - ${today}*\n`;
-    reportMsg += `━━━━━━━━━━━━━━━━\n\n`;
-
-    reportMsg += `📊 *Overall:*\n`;
-    reportMsg += `Total Users: *${allUsers.length}*\n`;
-    reportMsg += `Submitted: *${submitted.length}*\n`;
-    reportMsg += `Pending: *${notSubmitted.length}*\n`;
-    reportMsg += `Rate: *${allUsers.length > 0 ? Math.round(submitted.length / allUsers.length * 100) : 0}%*\n\n`;
-
-    if (submitted.length > 0) {
-      reportMsg += `*✅ Completed (${submitted.length}):*\n`;
-      submitted.forEach((u, i) => {
-        const name = u.first_name || u.username || `User ${u.telegram_id}`;
-        const time = u.submitted_at ? moment(u.submitted_at).format('HH:mm') : '--:--';
-        reportMsg += `  ${i + 1}. ${name} ✅ ${time}\n`;
-      });
-      reportMsg += '\n';
-    }
-
-    if (notSubmitted.length > 0) {
-      reportMsg += `*❌ Missing (${notSubmitted.length}):* — NEEDS PENALTY\n`;
-      notSubmitted.forEach((u, i) => {
-        const name = u.first_name || u.username || `User ${u.telegram_id}`;
-        reportMsg += `  ${i + 1}. ${name}\n`;
-      });
-      reportMsg += '\n';
-    }
-
-    reportMsg += `*📆 Monthly Summary (Days ${daysInMonth}):*\n`;
-    const sortedUsers = allUsers.map(u => {
-      const monthSubs = db.getSubmissionsInRange(u.telegram_id, startOfMonth, endOfMonth);
-      const penalties = db.getUserPenalties(u.telegram_id);
-      const monthPenalties = penalties.filter(p => p.penalty_date >= startOfMonth && p.penalty_date <= endOfMonth);
-      return {
-        ...u,
-        monthCount: monthSubs.length,
-        penaltyCount: monthPenalties.length,
-        streak: db.calculateStreak(u.telegram_id)
-      };
-    }).sort((a, b) => b.monthCount - a.monthCount);
-
-    sortedUsers.forEach((u, i) => {
-      const name = u.first_name || u.username || `User ${u.telegram_id}`;
-      const missed = daysInMonth - u.monthCount;
-      reportMsg += `  ${i + 1}. ${name}: ${u.monthCount}/${daysInMonth}`;
-      if (u.streak > 0) reportMsg += ` 🔥${u.streak}d`;
-      if (missed > 0) reportMsg += ` ❌${missed}`;
-      if (u.penaltyCount > 0) reportMsg += ` ⚠️${u.penaltyCount}`;
-      reportMsg += '\n';
-    });
-
-    bot.sendMessage(chatId, reportMsg, { parse_mode: 'Markdown' });
-  });
-
-  // Check missing users
-  bot.onText(/\/check/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
-
-    const today = getToday();
-    const usersStatus = db.getAllUsersWithTodayStatus(today);
-    const notSubmitted = usersStatus.filter(u => !u.submission_id);
-
-    if (notSubmitted.length === 0) {
-      bot.sendMessage(chatId, '🎉 *Everyone has submitted today!* Great job!', { parse_mode: 'Markdown' });
-      return;
-    }
-
-    let checkMsg = `❌ ${notSubmitted.length} users haven't submitted yet today:\n\n`;
-    notSubmitted.forEach((u, i) => {
-      const name = formatUserDisplay(u);
-      checkMsg += `${i + 1}. ${name}\n`;
-    });
-
-    checkMsg += `\nDeadline: ${getDeadlineTime()}`;
-    bot.sendMessage(chatId, checkMsg, { parse_mode: 'Markdown' });
-  });
-
-  // Add penalty (admin)
-  bot.onText(/\/penalty(?:\s+(\d+))?/, (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
-
-    const targetUserId = match[1] ? parseInt(match[1]) : null;
-
-    if (!targetUserId) {
-      const today = getToday();
-      const usersStatus = db.getAllUsersWithTodayStatus(today);
-      const notSubmitted = usersStatus.filter(u => !u.submission_id);
-
-      if (notSubmitted.length === 0) {
-        bot.sendMessage(chatId, '✅ Everyone has submitted. No penalties needed!');
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
         return;
       }
 
-      let msg = `Add penalty by replying with user ID:\n/penalty <user_id>\n\nPending users:\n`;
+      const today = getToday();
+      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+
+      const submitted = usersStatus.filter(u => u.submission_id);
+      const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+      let statusMsg = `📊 *Today's Status - ${today}*\n\n`;
+      statusMsg += `✅ Submitted: *${submitted.length}/${usersStatus.length}*\n`;
+      statusMsg += `❌ Missing: *${notSubmitted.length}/${usersStatus.length}*\n\n`;
+
+      if (submitted.length > 0) {
+        statusMsg += `*✅ Submitted:*\n`;
+        submitted.forEach(u => {
+          const name = u.first_name || u.username || `User ${u.telegram_id}`;
+          const time = u.submitted_at ? moment(u.submitted_at).format('HH:mm') : '--:--';
+          const duration = u.duration > 0 ? `(${Math.floor(u.duration / 60)}m ${u.duration % 60}s)` : '';
+          const type = u.file_type === 'voice' ? '🎤' : u.file_type === 'video' ? '📹' : '🎵';
+          statusMsg += `${type} ${name} - ${time} ${duration}\n`;
+        });
+        statusMsg += '\n';
+      }
+
+      if (notSubmitted.length > 0) {
+        statusMsg += `*❌ Not Submitted:*\n`;
+        notSubmitted.forEach(u => {
+          const name = u.first_name || u.username || `User ${u.telegram_id}`;
+          statusMsg += `• ${name}\n`;
+        });
+      }
+
+      await bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /status:', err.message);
+    }
+  });
+
+  // Full report
+  bot.onText(/\/report/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+
+      const today = getToday();
+      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const allUsers = await db.getAllActiveUsers();
+
+      const submitted = usersStatus.filter(u => u.submission_id);
+      const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+      const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
+      const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
+      const daysInMonth = moment().tz(TIMEZONE).date();
+
+      let reportMsg = `📋 *Daily Report - ${today}*\n`;
+      reportMsg += `━━━━━━━━━━━━━━━━\n\n`;
+
+      reportMsg += `📊 *Overall:*\n`;
+      reportMsg += `Total Users: *${allUsers.length}*\n`;
+      reportMsg += `Submitted: *${submitted.length}*\n`;
+      reportMsg += `Pending: *${notSubmitted.length}*\n`;
+      reportMsg += `Rate: *${allUsers.length > 0 ? Math.round(submitted.length / allUsers.length * 100) : 0}%*\n\n`;
+
+      if (submitted.length > 0) {
+        reportMsg += `*✅ Completed (${submitted.length}):*\n`;
+        submitted.forEach((u, i) => {
+          const name = u.first_name || u.username || `User ${u.telegram_id}`;
+          const time = u.submitted_at ? moment(u.submitted_at).format('HH:mm') : '--:--';
+          reportMsg += `  ${i + 1}. ${name} ✅ ${time}\n`;
+        });
+        reportMsg += '\n';
+      }
+
+      if (notSubmitted.length > 0) {
+        reportMsg += `*❌ Missing (${notSubmitted.length}):* — NEEDS PENALTY\n`;
+        notSubmitted.forEach((u, i) => {
+          const name = u.first_name || u.username || `User ${u.telegram_id}`;
+          reportMsg += `  ${i + 1}. ${name}\n`;
+        });
+        reportMsg += '\n';
+      }
+
+      reportMsg += `*📆 Monthly Summary (Days ${daysInMonth}):*\n`;
+      const sortedUsers = [];
+      for (const u of allUsers) {
+        const monthSubs = await db.getSubmissionsInRange(u.telegram_id, startOfMonth, endOfMonth);
+        const penalties = await db.getUserPenalties(u.telegram_id);
+        const monthPenalties = penalties.filter(p => p.penalty_date >= startOfMonth && p.penalty_date <= endOfMonth);
+        const streak = await db.calculateStreak(u.telegram_id);
+        sortedUsers.push({ ...u, monthCount: monthSubs.length, penaltyCount: monthPenalties.length, streak });
+      }
+      sortedUsers.sort((a, b) => b.monthCount - a.monthCount);
+
+      sortedUsers.forEach((u, i) => {
+        const name = u.first_name || u.username || `User ${u.telegram_id}`;
+        const missed = daysInMonth - u.monthCount;
+        reportMsg += `  ${i + 1}. ${name}: ${u.monthCount}/${daysInMonth}`;
+        if (u.streak > 0) reportMsg += ` 🔥${u.streak}d`;
+        if (missed > 0) reportMsg += ` ❌${missed}`;
+        if (u.penaltyCount > 0) reportMsg += ` ⚠️${u.penaltyCount}`;
+        reportMsg += '\n';
+      });
+
+      await bot.sendMessage(chatId, reportMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /report:', err.message);
+    }
+  });
+
+  // Check missing users
+  bot.onText(/\/check/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+
+      const today = getToday();
+      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+      if (notSubmitted.length === 0) {
+        await bot.sendMessage(chatId, '🎉 *Everyone has submitted today!* Great job!', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let checkMsg = `❌ ${notSubmitted.length} users haven't submitted yet today:\n\n`;
       notSubmitted.forEach((u, i) => {
         const name = formatUserDisplay(u);
-        msg += `${i + 1}. ID: \`${u.telegram_id}\` - ${name}\n`;
+        checkMsg += `${i + 1}. ${name}\n`;
       });
-      bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-      return;
+
+      checkMsg += `\nDeadline: ${getDeadlineTime()}`;
+      await bot.sendMessage(chatId, checkMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /check:', err.message);
     }
+  });
 
-    const user = db.getUser(targetUserId);
-    if (!user) {
-      bot.sendMessage(chatId, `❌ User ${targetUserId} not found.`);
-      return;
+  // Add penalty (admin)
+  bot.onText(/\/penalty(?:\s+(\d+))?/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+
+      const targetUserId = match[1] ? parseInt(match[1]) : null;
+
+      if (!targetUserId) {
+        const today = getToday();
+        const usersStatus = await db.getAllUsersWithTodayStatus(today);
+        const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+        if (notSubmitted.length === 0) {
+          await bot.sendMessage(chatId, '✅ Everyone has submitted. No penalties needed!');
+          return;
+        }
+
+        let penaltyMsg = `Add penalty by replying with user ID:\n/penalty <user_id>\n\nPending users:\n`;
+        notSubmitted.forEach((u, i) => {
+          const name = formatUserDisplay(u);
+          penaltyMsg += `${i + 1}. ID: \`${u.telegram_id}\` - ${name}\n`;
+        });
+        await bot.sendMessage(chatId, penaltyMsg, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const user = await db.getUser(targetUserId);
+      if (!user) {
+        await bot.sendMessage(chatId, `❌ User ${targetUserId} not found.`);
+        return;
+      }
+
+      const today = getToday();
+      await db.addPenalty(targetUserId, today, 'Missed daily submission');
+
+      const name = formatUserDisplay(user);
+      await bot.sendMessage(chatId, `⚠️ Penalty added to ${name} for missing today's submission.`);
+    } catch (err) {
+      console.error('Error in /penalty:', err.message);
     }
-
-    const today = getToday();
-    db.addPenalty(targetUserId, today, 'Missed daily submission');
-
-    const name = formatUserDisplay(user);
-    bot.sendMessage(chatId, `⚠️ Penalty added to ${name} for missing today's submission.`);
   });
 
   // Broadcast message
-  bot.onText(/\/broadcast(?:\s+(.+))?/, (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/broadcast(?:\s+(.+))?/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
-
-    const message = match[1];
-
-    if (!message) {
-      bot.sendMessage(chatId, 'Usage: /broadcast <message>\nExample: /broadcast Reminder: Please submit your recording today!');
-      return;
-    }
-
-    const users = db.getAllActiveUsers();
-    let sent = 0;
-    let failed = 0;
-
-    users.forEach(user => {
-      try {
-        bot.sendMessage(user.telegram_id, `📢 *Broadcast:*\n\n${message}`, { parse_mode: 'Markdown' });
-        sent++;
-      } catch (err) {
-        failed++;
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
       }
-    });
 
-    bot.sendMessage(chatId, `📢 Broadcast sent!\n✅ Sent: ${sent}\n❌ Failed: ${failed}\n👥 Total: ${users.length}`);
+      const message = match[1];
+
+      if (!message) {
+        await bot.sendMessage(chatId, 'Usage: /broadcast <message>\nExample: /broadcast Reminder: Please submit your recording today!');
+        return;
+      }
+
+      const users = await db.getAllActiveUsers();
+      let sent = 0;
+      let failed = 0;
+
+      for (const user of users) {
+        try {
+          await bot.sendMessage(user.telegram_id, `📢 *Broadcast:*\n\n${message}`, { parse_mode: 'Markdown' });
+          sent++;
+        } catch (err) {
+          failed++;
+        }
+      }
+
+      await bot.sendMessage(chatId, `📢 Broadcast sent!\n✅ Sent: ${sent}\n❌ Failed: ${failed}\n👥 Total: ${users.length}`);
+    } catch (err) {
+      console.error('Error in /broadcast:', err.message);
+    }
   });
 
   // Set deadline
-  bot.onText(/\/setdeadline\s+(\d{1,2}):(\d{2})/, (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
+  bot.onText(/\/setdeadline\s+(\d{1,2}):(\d{2})/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
 
-    if (!isAdmin(userId)) return bot.sendMessage(chatId, '⛔ Not authorized.');
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
 
-    const hour = parseInt(match[1]);
-    const minute = parseInt(match[2]);
+      const hour = parseInt(match[1]);
+      const minute = parseInt(match[2]);
 
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-      bot.sendMessage(chatId, '❌ Invalid time. Use HH:MM format (e.g., 23:59)');
-      return;
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        await bot.sendMessage(chatId, '❌ Invalid time. Use HH:MM format (e.g., 23:59)');
+        return;
+      }
+
+      process.env.DEADLINE_HOUR = hour.toString();
+      process.env.DEADLINE_MINUTE = minute.toString();
+
+      await bot.sendMessage(chatId, `⏰ Deadline updated to ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} (will reset on restart)`);
+    } catch (err) {
+      console.error('Error in /setdeadline:', err.message);
     }
-
-    process.env.DEADLINE_HOUR = hour.toString();
-    process.env.DEADLINE_MINUTE = minute.toString();
-
-    bot.sendMessage(chatId, `⏰ Deadline updated to ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} (will reset on restart)`);
   });
 
   // ===== MEDIA HANDLERS (Recordings) =====
 
-  function handleMediaSubmission(msg) {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const username = msg.from.username || null;
-    const firstName = msg.from.first_name || null;
-    const lastName = msg.from.last_name || null;
+  async function handleMediaSubmission(msg) {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+      const username = msg.from.username || null;
+      const firstName = msg.from.first_name || null;
+      const lastName = msg.from.last_name || null;
 
-    db.registerUser(userId, username, firstName, lastName);
+      await db.registerUser(userId, username, firstName, lastName);
 
-    const validation = validateSubmission(msg);
+      const validation = validateSubmission(msg);
 
-    if (!validation.valid) {
-      if (validation.reason === 'no_media') {
+      if (!validation.valid) {
+        if (validation.reason === 'no_media') {
+          return;
+        }
+        await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 3 minutes.`);
         return;
       }
-      bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 3 minutes.`);
-      return;
-    }
 
-    const today = getToday();
-    const result = db.recordSubmission(
-      userId,
-      validation.fileId,
-      validation.fileType,
-      validation.duration,
-      msg.caption || null,
-      today
-    );
-
-    if (result.success) {
-      const durationStr = validation.duration > 0
-        ? `(${Math.floor(validation.duration / 60)}m ${validation.duration % 60}s)`
-        : '';
-
-      const streak = db.calculateStreak(userId);
-      let streakMsg = '';
-      if (streak > 0) {
-        if (streak === 1) streakMsg = '\n🔥 Streak started! Day 1!';
-        else if (streak < 7) streakMsg = `\n🔥 ${streak}-day streak!`;
-        else streakMsg = `\n🔥🔥 ${streak}-day streak! Amazing!`;
-      }
-
-      const typeEmoji = validation.fileType === 'voice' ? '🎤' :
-                        validation.fileType === 'video' ? '📹' : '🎵';
-
-      bot.sendMessage(chatId,
-        `✅ *Submission Recorded!* ${typeEmoji}\n` +
-        `📅 ${today}\n` +
-        `⏱ ${durationStr}${streakMsg}\n\n` +
-        `Keep up the great work! 🚀\n` +
-        `Check your stats with /mystats`,
-        { parse_mode: 'Markdown' }
+      const today = getToday();
+      const result = await db.recordSubmission(
+        userId,
+        validation.fileId,
+        validation.fileType,
+        validation.duration,
+        msg.caption || null,
+        today
       );
 
-      const user = db.getUser(userId);
-      const userName = formatUserDisplay(user);
-      ADMIN_IDS.forEach(adminId => {
-        try {
-          bot.sendMessage(adminId,
-            `✅ *Submission Received*\n👤 ${userName}\n📅 ${today}\n⏱ ${durationStr}${streakMsg}`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (e) {}
-      });
-    } else {
-      bot.sendMessage(chatId, `⚠️ ${result.message}\n\nYou can view your stats with /mystats`);
+      if (result.success) {
+        const durationStr = validation.duration > 0
+          ? `(${Math.floor(validation.duration / 60)}m ${validation.duration % 60}s)`
+          : '';
+
+        const streak = await db.calculateStreak(userId);
+        let streakMsg = '';
+        if (streak > 0) {
+          if (streak === 1) streakMsg = '\n🔥 Streak started! Day 1!';
+          else if (streak < 7) streakMsg = `\n🔥 ${streak}-day streak!`;
+          else streakMsg = `\n🔥🔥 ${streak}-day streak! Amazing!`;
+        }
+
+        const typeEmoji = validation.fileType === 'voice' ? '🎤' :
+                          validation.fileType === 'video' ? '📹' : '🎵';
+
+        await bot.sendMessage(chatId,
+          `✅ *Submission Recorded!* ${typeEmoji}\n` +
+          `📅 ${today}\n` +
+          `⏱ ${durationStr}${streakMsg}\n\n` +
+          `Keep up the great work! 🚀\n` +
+          `Check your stats with /mystats`,
+          { parse_mode: 'Markdown' }
+        );
+
+        const user = await db.getUser(userId);
+        const userName = formatUserDisplay(user);
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.sendMessage(adminId,
+              `✅ *Submission Received*\n👤 ${userName}\n📅 ${today}\n⏱ ${durationStr}${streakMsg}`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (e) {}
+        }
+      } else {
+        await bot.sendMessage(chatId, `⚠️ ${result.message}\n\nYou can view your stats with /mystats`);
+      }
+    } catch (err) {
+      console.error('Error in handleMediaSubmission:', err.message);
     }
   }
 
@@ -665,149 +750,163 @@ Just send a voice message, video, or audio file of at least 3 minutes!
   // ===== SCHEDULED TASKS =====
 
   // Reminder at 22:00 (10 PM) daily
-  cron.schedule('0 22 * * *', () => {
-    const today = getToday();
-    const usersStatus = db.getAllUsersWithTodayStatus(today);
-    const notSubmitted = usersStatus.filter(u => !u.submission_id);
+  cron.schedule('0 22 * * *', async () => {
+    try {
+      const today = getToday();
+      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const notSubmitted = usersStatus.filter(u => !u.submission_id);
 
-    if (notSubmitted.length === 0) return;
+      if (notSubmitted.length === 0) return;
 
-    notSubmitted.forEach(u => {
-      const name = u.first_name || 'there';
-      try {
-        bot.sendMessage(u.telegram_id,
-          `⏰ *Reminder!*\n\nHey ${name}! Don't forget to submit your daily English recording today! 🎤\n\nDeadline: ${getDeadlineTime()}\n\nSend your recording now! 🚀`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (e) {}
-    });
-
-    const names = notSubmitted.map(u => u.first_name || u.username || `User ${u.telegram_id}`).join(', ');
-    ADMIN_IDS.forEach(adminId => {
-      try {
-        bot.sendMessage(adminId,
-          `⏰ *Reminder sent to ${notSubmitted.length} users*\n\nPending: ${names}`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (e) {}
-    });
-  });
-
-  // Deadline alert at 23:59
-  cron.schedule('59 23 * * *', () => {
-    const today = getToday();
-    const usersStatus = db.getAllUsersWithTodayStatus(today);
-    const notSubmitted = usersStatus.filter(u => !u.submission_id);
-
-    if (notSubmitted.length === 0) {
-      ADMIN_IDS.forEach(adminId => {
+      for (const u of notSubmitted) {
+        const name = u.first_name || 'there';
         try {
-          bot.sendMessage(adminId,
-            `🎉 *All clear!* Everyone submitted today!\n📅 ${today}`,
+          await bot.sendMessage(u.telegram_id,
+            `⏰ *Reminder!*\n\nHey ${name}! Don't forget to submit your daily English recording today! 🎤\n\nDeadline: ${getDeadlineTime()}\n\nSend your recording now! 🚀`,
             { parse_mode: 'Markdown' }
           );
         } catch (e) {}
-      });
-      return;
+      }
+
+      const names = notSubmitted.map(u => u.first_name || u.username || `User ${u.telegram_id}`).join(', ');
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await bot.sendMessage(adminId,
+            `⏰ *Reminder sent to ${notSubmitted.length} users*\n\nPending: ${names}`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (e) {}
+      }
+    } catch (err) {
+      console.error('Error in reminder cron:', err.message);
     }
+  });
 
-    let reportMsg = `⛔ *Deadline Reached - ${today}*\n\n`;
-    reportMsg += `Missing submissions: *${notSubmitted.length}*\n\n`;
-    reportMsg += `*Need to add penalties:*\n`;
-    notSubmitted.forEach((u, i) => {
-      const name = formatUserDisplay(u);
-      reportMsg += `${i + 1}. ${name}\n`;
-      reportMsg += `   -> Use: /penalty ${u.telegram_id}\n`;
-    });
+  // Deadline alert at 23:59
+  cron.schedule('59 23 * * *', async () => {
+    try {
+      const today = getToday();
+      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const notSubmitted = usersStatus.filter(u => !u.submission_id);
 
-    ADMIN_IDS.forEach(adminId => {
-      try {
-        bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
-      } catch (e) {}
-    });
+      if (notSubmitted.length === 0) {
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.sendMessage(adminId,
+              `🎉 *All clear!* Everyone submitted today!\n📅 ${today}`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (e) {}
+        }
+        return;
+      }
 
-    notSubmitted.forEach(u => {
-      const name = u.first_name || 'there';
-      try {
-        bot.sendMessage(u.telegram_id,
-          `⛔ *Deadline Missed!*\n\nHey ${name}, you didn't submit your English recording today.\n\nDon't worry - start fresh tomorrow! Every day is a new opportunity! 💪`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (e) {}
-    });
+      let reportMsg = `⛔ *Deadline Reached - ${today}*\n\n`;
+      reportMsg += `Missing submissions: *${notSubmitted.length}*\n\n`;
+      reportMsg += `*Need to add penalties:*\n`;
+      notSubmitted.forEach((u, i) => {
+        const name = formatUserDisplay(u);
+        reportMsg += `${i + 1}. ${name}\n`;
+        reportMsg += `   -> Use: /penalty ${u.telegram_id}\n`;
+      });
+
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
+        } catch (e) {}
+      }
+
+      for (const u of notSubmitted) {
+        const name = u.first_name || 'there';
+        try {
+          await bot.sendMessage(u.telegram_id,
+            `⛔ *Deadline Missed!*\n\nHey ${name}, you didn't submit your English recording today.\n\nDon't worry - start fresh tomorrow! Every day is a new opportunity! 💪`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (e) {}
+      }
+    } catch (err) {
+      console.error('Error in deadline cron:', err.message);
+    }
   });
 
   // Morning motivation at 7:00
-  cron.schedule('0 7 * * *', () => {
-    const users = db.getAllActiveUsers();
-    const messages = [
-      '🌅 Good morning! Ready to practice your English today? 🎤',
-      '☀️ New day, new opportunity! Don\'t forget your English recording! 🚀',
-      '🌄 Rise and shine! Your English practice awaits! Send your recording today! 💪',
-      '🌟 Good morning! Make today count with your English practice! 🎯',
-      '🌞 Start your day strong! Record your English practice now! 🔥'
-    ];
+  cron.schedule('0 7 * * *', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      const messages = [
+        '🌅 Good morning! Ready to practice your English today? 🎤',
+        '☀️ New day, new opportunity! Don\'t forget your English recording! 🚀',
+        '🌄 Rise and shine! Your English practice awaits! Send your recording today! 💪',
+        '🌟 Good morning! Make today count with your English practice! 🎯',
+        '🌞 Start your day strong! Record your English practice now! 🔥'
+      ];
 
-    const message = messages[Math.floor(Math.random() * messages.length)];
+      const message = messages[Math.floor(Math.random() * messages.length)];
 
-    users.forEach(user => {
-      try {
-        bot.sendMessage(user.telegram_id, message);
-      } catch (e) {}
-    });
+      for (const user of users) {
+        try {
+          await bot.sendMessage(user.telegram_id, message);
+        } catch (e) {}
+      }
+    } catch (err) {
+      console.error('Error in morning cron:', err.message);
+    }
   });
 
   // Weekly summary on Sunday at 20:00
-  cron.schedule('0 20 * * 0', () => {
-    const users = db.getAllActiveUsers();
-    const endDate = getToday();
-    const startDate = moment().tz(TIMEZONE).subtract(7, 'days').format('YYYY-MM-DD');
+  cron.schedule('0 20 * * 0', async () => {
+    try {
+      const users = await db.getAllActiveUsers();
+      const endDate = getToday();
+      const startDate = moment().tz(TIMEZONE).subtract(7, 'days').format('YYYY-MM-DD');
 
-    users.forEach(user => {
-      const weekSubs = db.getSubmissionsInRange(user.telegram_id, startDate, endDate);
-      const streak = db.calculateStreak(user.telegram_id);
-      const name = user.first_name || 'there';
+      for (const user of users) {
+        const weekSubs = await db.getSubmissionsInRange(user.telegram_id, startDate, endDate);
+        const streak = await db.calculateStreak(user.telegram_id);
+        const name = user.first_name || 'there';
 
-      let msg = `📊 *Weekly Summary*\n\n`;
-      msg += `Hey ${name}! Here's your progress this week:\n\n`;
-      msg += `📅 Submissions: ${weekSubs.length}/7 days\n`;
-      msg += `🔥 Current streak: ${streak} day(s)\n\n`;
+        let msg = `📊 *Weekly Summary*\n\n`;
+        msg += `Hey ${name}! Here's your progress this week:\n\n`;
+        msg += `📅 Submissions: ${weekSubs.length}/7 days\n`;
+        msg += `🔥 Current streak: ${streak} day(s)\n\n`;
 
-      if (weekSubs.length >= 5) {
-        msg += `🌟 Great job this week! Keep it up! 🚀`;
-      } else if (weekSubs.length >= 3) {
-        msg += `💪 Good effort! Try to be more consistent next week!`;
-      } else {
-        msg += `📈 Let's aim for more submissions next week! You can do it! 💪`;
+        if (weekSubs.length >= 5) {
+          msg += `🌟 Great job this week! Keep it up! 🚀`;
+        } else if (weekSubs.length >= 3) {
+          msg += `💪 Good effort! Try to be more consistent next week!`;
+        } else {
+          msg += `📈 Let's aim for more submissions next week! You can do it! 💪`;
+        }
+
+        try {
+          await bot.sendMessage(user.telegram_id, msg, { parse_mode: 'Markdown' });
+        } catch (e) {}
       }
-
-      try {
-        bot.sendMessage(user.telegram_id, msg, { parse_mode: 'Markdown' });
-      } catch (e) {}
-    });
+    } catch (err) {
+      console.error('Error in weekly cron:', err.message);
+    }
   });
 
   // Error handling
   bot.on('polling_error', (error) => {
-    console.error('Polling error:', error.message);
+    console.error('Polling error:', error.code, error.message);
   });
 
   bot.on('error', (error) => {
-    console.error('Bot error:', error.message);
+    console.error('Bot error:', error.code, error.message);
   });
 
   // Graceful shutdown
-  process.on('SIGINT', () => {
+  const shutdown = async () => {
     console.log('\n🤖 Bot shutting down...');
-    db.close();
+    await db.close();
+    server.close();
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', () => {
-    console.log('\n🤖 Bot shutting down...');
-    db.close();
-    process.exit(0);
-  });
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 startBot().catch(err => {
