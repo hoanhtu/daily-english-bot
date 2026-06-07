@@ -9,59 +9,76 @@ class DatabaseManager {
 
   async init() {
     try {
+      // Parse DATABASE_URL manually to avoid URL encoding issues
+      const dbUrl = process.env.DATABASE_URL || '';
+      
       this.pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+        connectionString: dbUrl,
         ssl: {
           rejectUnauthorized: false
         },
-        max: 5,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 10000
+        max: 2,
+        idleTimeoutMillis: 60000,
+        connectionTimeoutMillis: 15000,
+        keepAlive: true
       });
 
-      // Handle pool errors
       this.pool.on('error', (err) => {
         console.error('Database pool error:', err.message);
       });
 
-      // Test connection
-      const client = await this.pool.connect();
-      await client.query('SELECT 1');
-      client.release();
+      // Test connection with retry
+      let connected = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const client = await this.pool.connect();
+          await client.query('SELECT 1');
+          client.release();
+          connected = true;
+          console.log('✅ Connected to Supabase PostgreSQL');
+          break;
+        } catch (err) {
+          console.error(`❌ Connection attempt ${attempt}/3 failed:`, err.message);
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+        }
+      }
 
-      console.log('✅ Connected to Supabase PostgreSQL');
+      if (!connected) {
+        throw new Error('Could not connect to database after 3 attempts');
+      }
     } catch (err) {
-      console.error('❌ Database connection failed:', err.message);
-      console.error('   Check your DATABASE_URL in .env file');
+      console.error('❌ Database initialization failed:', err.message);
       throw err;
     }
   }
 
-  async getPool() {
-    if (!this.pool) {
+  async query(sql, params = []) {
+    try {
+      const result = await this.pool.query(sql, params);
+      return result;
+    } catch (err) {
+      // Try to reconnect once
+      console.error('Query error, reconnecting...', err.message);
       await this.init();
+      const result = await this.pool.query(sql, params);
+      return result;
     }
-    return this.pool;
   }
 
   async queryAll(sql, params = []) {
-    const pool = await this.getPool();
-    const result = await pool.query(sql, params);
+    const result = await this.query(sql, params);
     return result.rows;
   }
 
   async queryOne(sql, params = []) {
-    const pool = await this.getPool();
-    const result = await pool.query(sql, params);
+    const result = await this.query(sql, params);
     return result.rows.length > 0 ? result.rows[0] : null;
   }
 
   async run(sql, params = []) {
-    const pool = await this.getPool();
-    await pool.query(sql, params);
+    await this.query(sql, params);
   }
 
-  // Register or get user
   async registerUser(telegramId, username, firstName, lastName) {
     const existing = await this.queryOne('SELECT * FROM users WHERE telegram_id = $1', [telegramId]);
     if (existing) {
@@ -89,9 +106,10 @@ class DatabaseManager {
     await this.run('UPDATE users SET is_active = 0 WHERE telegram_id = $1', [telegramId]);
   }
 
-  // Submission management
   async recordSubmission(userId, fileId, fileType, duration, caption, date) {
-    // Check if already submitted today
+    const timezone = process.env.TIMEZONE || 'Asia/Saigon';
+    const today = moment().tz(timezone).format('YYYY-MM-DD');
+
     const existing = await this.queryOne(
       'SELECT id FROM submissions WHERE user_id = $1 AND submission_date = $2 AND is_valid = 1',
       [userId, date]
@@ -105,6 +123,27 @@ class DatabaseManager {
       'INSERT INTO submissions (user_id, submission_date, file_id, file_type, duration, caption) VALUES ($1, $2, $3, $4, $5, $6)',
       [userId, date, fileId, fileType, duration || 0, caption || null]
     );
+
+    // Auto-penalty: check if yesterday was missed
+    const yesterday = moment().tz(timezone).subtract(1, 'day').format('YYYY-MM-DD');
+    const yesterdaySub = await this.queryOne(
+      'SELECT id FROM submissions WHERE user_id = $1 AND submission_date = $2 AND is_valid = 1',
+      [userId, yesterday]
+    );
+
+    if (!yesterdaySub && date === today) {
+      const existingPenalty = await this.queryOne(
+        'SELECT id FROM penalties WHERE user_id = $1 AND penalty_date = $2',
+        [userId, yesterday]
+      );
+      if (!existingPenalty) {
+        await this.run(
+          'INSERT INTO penalties (user_id, penalty_date, reason) VALUES ($1, $2, $3)',
+          [userId, yesterday, 'Missed daily submission']
+        );
+        return { success: true, message: 'Submission recorded! ⚠️ You missed yesterday so a penalty was added.' };
+      }
+    }
 
     return { success: true, message: 'Submission recorded successfully!' };
   }
@@ -130,7 +169,7 @@ class DatabaseManager {
 
   async getSubmissionsInRange(userId, startDate, endDate) {
     return this.queryAll(`
-      SELECT submission_date FROM submissions
+      SELECT submission_date::text as submission_date FROM submissions
       WHERE user_id = $1 AND submission_date >= $2 AND submission_date <= $3 AND is_valid = 1
       ORDER BY submission_date
     `, [userId, startDate, endDate]);
@@ -144,7 +183,6 @@ class DatabaseManager {
     return row ? parseInt(row.count) : 0;
   }
 
-  // Penalty management
   async addPenalty(userId, penaltyDate, reason) {
     await this.run(
       'INSERT INTO penalties (user_id, penalty_date, reason) VALUES ($1, $2, $3)',
@@ -166,7 +204,6 @@ class DatabaseManager {
     return row ? parseInt(row.count) : 0;
   }
 
-  // Stats
   async getUserStats(userId) {
     const totalSubmissions = await this.queryOne(`
       SELECT COUNT(*) as count FROM submissions 
@@ -177,7 +214,7 @@ class DatabaseManager {
     const totalPenalties = await this.getPenaltyCount(userId);
     
     const lastSubmission = await this.queryOne(`
-      SELECT submission_date FROM submissions 
+      SELECT submission_date::text as submission_date FROM submissions 
       WHERE user_id = $1 AND is_valid = 1
       ORDER BY submission_date DESC LIMIT 1
     `, [userId]);
@@ -201,21 +238,14 @@ class DatabaseManager {
 
     if (submissions.length === 0) return 0;
 
-    // Allow 1 grace day in streak (user can skip 1 day)
     let streak = 0;
     let expectedDate = moment().tz(process.env.TIMEZONE || 'Asia/Saigon').format('YYYY-MM-DD');
-    let gracesUsed = 0;
 
     for (const sub of submissions) {
       const subDate = String(sub.submission_date);
       if (subDate === expectedDate) {
         streak++;
         expectedDate = moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD');
-      } else if (subDate === moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD') && gracesUsed === 0) {
-        // Grace day: skipped 1 day, but submitted the day before that
-        streak++;
-        gracesUsed = 1;
-        expectedDate = moment(expectedDate).subtract(2, 'day').format('YYYY-MM-DD');
       } else {
         break;
       }
@@ -224,7 +254,6 @@ class DatabaseManager {
     return streak;
   }
 
-  // Admin: get all users with today's status
   async getAllUsersWithTodayStatus(today) {
     return this.queryAll(`
       SELECT 
