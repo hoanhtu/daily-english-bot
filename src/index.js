@@ -110,6 +110,19 @@ async function startBot() {
   console.log(`📍 Timezone: ${TIMEZONE}`);
   console.log(`👤 Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None configured'}`);
 
+  // Set command suggestions (shows when typing /)
+  await bot.setMyCommands([
+    { command: 'start', description: 'Welcome & instructions' },
+    { command: 'submit', description: 'How to submit recordings' },
+    { command: 'mystats', description: 'Your personal statistics' },
+    { command: 'streak', description: 'Check your current streak' },
+    { command: 'history', description: 'View recent submissions' },
+    { command: 'leaderboard', description: 'Monthly leaderboard' },
+    { command: 'myid', description: 'Get your Telegram user ID' },
+    { command: 'help', description: 'Show all commands' }
+  ]);
+  console.log('✅ Command suggestions registered');
+
   // ===== COMMAND HANDLERS =====
 
   // Start command

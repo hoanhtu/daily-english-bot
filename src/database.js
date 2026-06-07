@@ -201,15 +201,22 @@ class DatabaseManager {
 
     if (submissions.length === 0) return 0;
 
+    // Allow 1 grace day in streak (user can skip 1 day)
     let streak = 0;
     let expectedDate = moment().tz(process.env.TIMEZONE || 'Asia/Saigon').format('YYYY-MM-DD');
+    let gracesUsed = 0;
 
     for (const sub of submissions) {
       const subDate = String(sub.submission_date);
       if (subDate === expectedDate) {
         streak++;
         expectedDate = moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD');
-      } else if (subDate < expectedDate) {
+      } else if (subDate === moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD') && gracesUsed === 0) {
+        // Grace day: skipped 1 day, but submitted the day before that
+        streak++;
+        gracesUsed = 1;
+        expectedDate = moment(expectedDate).subtract(2, 'day').format('YYYY-MM-DD');
+      } else {
         break;
       }
     }
