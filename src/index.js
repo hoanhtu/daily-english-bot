@@ -75,7 +75,7 @@ function validateSubmission(msg) {
     }
   }
 
-  const minDuration = 180;
+  const minDuration = 300; // 5 minutes (300 seconds)
   if (fileId && (duration >= minDuration || duration === 0)) {
     return { valid: true, fileId, fileType, duration };
   }
@@ -83,7 +83,7 @@ function validateSubmission(msg) {
   if (fileId && duration > 0 && duration < minDuration) {
     return {
       valid: false,
-      reason: `Your recording is only ${Math.floor(duration / 60)}m ${duration % 60}s long. Minimum required is 3 minutes (180s).`
+      reason: `Your recording is only ${Math.floor(duration / 60)}m ${duration % 60}s long. Minimum required is 5 minutes!`
     };
   }
 
@@ -144,7 +144,7 @@ Welcome ${firstName || 'there'}! I'm here to help you track your daily English p
 /help - Show all commands
 
 *Deadline:* ${getDeadlineTime()} daily
-*Minimum:* 3 minutes per recording
+*Minimum:* 5 minutes per recording
 
 Let's practice English every day! 🚀
 `;
@@ -176,7 +176,7 @@ Let's practice English every day! 🚀
 Simply *send a voice message, video, or audio file* in this chat!
 
 *Requirements:*
-⏱ Minimum *3 minutes* long
+⏱ Minimum *5 minutes* long
 🗣 Speak in English
 📅 One submission per day
 
@@ -355,7 +355,7 @@ ${isAdmin(userId) ? `
 ` : ''}
 
 *How to submit:*
-Just send a voice message, video, or audio file of at least 3 minutes!
+Just send a voice message, video, or audio file of at least 5 minutes!
 
 *Deadline:* ${getDeadlineTime()} daily
 `;
@@ -380,17 +380,17 @@ Just send a voice message, video, or audio file of at least 3 minutes!
       }
 
       const adminMsg = `
-🔧 *Admin Panel*
+🔧 Admin Panel
 
-/status 📊 - Today's submission status
-/report 📋 - Full daily report with stats
-/check ❌ - Users who haven't submitted
-/penalty <user_id> - Add penalty to user
-/broadcast 📢 - Broadcast message to all users
-/setdeadline ⏰ - Set deadline (HH:MM format)
+/status - Today's submission status
+/report - Full daily report with stats
+/check - Users who haven't submitted
+/penalty [user_id] - Add penalty to user
+/broadcast [message] - Broadcast to all users
+/setdeadline HH:MM - Set deadline time
 `;
 
-      await bot.sendMessage(chatId, adminMsg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, adminMsg);
     } catch (err) {
       console.error('Error in /admin:', err.message);
     }
@@ -684,7 +684,7 @@ Just send a voice message, video, or audio file of at least 3 minutes!
         if (validation.reason === 'no_media') {
           return;
         }
-        await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 3 minutes.`);
+        await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 5 minutes.`);
         return;
       }
 

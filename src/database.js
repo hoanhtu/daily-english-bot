@@ -3,31 +3,62 @@ const moment = require('moment');
 
 class DatabaseManager {
   constructor() {
-    this.pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: {
-        rejectUnauthorized: false
-      }
-    });
+    this.pool = null;
     this.ready = this.init();
   }
 
   async init() {
-    console.log('✅ Connected to Supabase PostgreSQL');
+    try {
+      this.pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: {
+          rejectUnauthorized: false
+        },
+        max: 5,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000
+      });
+
+      // Handle pool errors
+      this.pool.on('error', (err) => {
+        console.error('Database pool error:', err.message);
+      });
+
+      // Test connection
+      const client = await this.pool.connect();
+      await client.query('SELECT 1');
+      client.release();
+
+      console.log('✅ Connected to Supabase PostgreSQL');
+    } catch (err) {
+      console.error('❌ Database connection failed:', err.message);
+      console.error('   Check your DATABASE_URL in .env file');
+      throw err;
+    }
+  }
+
+  async getPool() {
+    if (!this.pool) {
+      await this.init();
+    }
+    return this.pool;
   }
 
   async queryAll(sql, params = []) {
-    const result = await this.pool.query(sql, params);
+    const pool = await this.getPool();
+    const result = await pool.query(sql, params);
     return result.rows;
   }
 
   async queryOne(sql, params = []) {
-    const result = await this.pool.query(sql, params);
+    const pool = await this.getPool();
+    const result = await pool.query(sql, params);
     return result.rows.length > 0 ? result.rows[0] : null;
   }
 
   async run(sql, params = []) {
-    await this.pool.query(sql, params);
+    const pool = await this.getPool();
+    await pool.query(sql, params);
   }
 
   // Register or get user
@@ -163,7 +194,7 @@ class DatabaseManager {
 
   async calculateStreak(userId) {
     const submissions = await this.queryAll(`
-      SELECT submission_date FROM submissions
+      SELECT submission_date::text as submission_date FROM submissions
       WHERE user_id = $1 AND is_valid = 1
       ORDER BY submission_date DESC
     `, [userId]);
@@ -171,13 +202,14 @@ class DatabaseManager {
     if (submissions.length === 0) return 0;
 
     let streak = 0;
-    let expectedDate = moment().format('YYYY-MM-DD');
+    let expectedDate = moment().tz(process.env.TIMEZONE || 'Asia/Saigon').format('YYYY-MM-DD');
 
     for (const sub of submissions) {
-      if (sub.submission_date === expectedDate) {
+      const subDate = String(sub.submission_date);
+      if (subDate === expectedDate) {
         streak++;
         expectedDate = moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD');
-      } else if (sub.submission_date < expectedDate) {
+      } else if (subDate < expectedDate) {
         break;
       }
     }
