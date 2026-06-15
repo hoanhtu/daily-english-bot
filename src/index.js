@@ -4,12 +4,17 @@ const cron = require('node-cron');
 const moment = require('moment-timezone');
 const DatabaseManager = require('./database');
 const http = require('http');
+const https = require('https');
 
 // Configuration
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Saigon';
 const PORT = process.env.PORT || 10000;
+
+// AI topic generation (Ollama Cloud) — optional. Falls back to the static list if unset/unavailable.
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
+const AI_MODEL = process.env.AI_MODEL || 'gpt-oss:120b';
 
 if (!TOKEN) {
   console.error('ERROR: TELEGRAM_BOT_TOKEN is not set in .env file!');
@@ -90,6 +95,115 @@ function validateSubmission(msg) {
   return { valid: false, reason: 'no_media' };
 }
 
+// Speaking topic suggestions (recommendation only — members are free to talk about anything)
+const SPEAKING_TOPICS = [
+  'Describe your typical morning routine and one thing you would change about it.',
+  'Talk about a skill you want to learn this year and why.',
+  'Describe your favorite meal and how it is made.',
+  'Tell a story about a time you helped a stranger.',
+  'If you could live in any country, which one would you choose and why?',
+  'Describe the best trip you have ever taken.',
+  'What does your ideal weekend look like?',
+  'Talk about a movie or book that changed how you think.',
+  'Describe a person who inspires you and explain why.',
+  'What are three things you are grateful for today?',
+  'Talk about your dream job and what a normal day there would look like.',
+  'Describe a challenge you faced and how you overcame it.',
+  'If you could have dinner with anyone in history, who would it be?',
+  'Talk about a habit you are trying to build or break.',
+  'Describe your hometown to someone who has never been there.',
+  'What technology do you think will change the world in 10 years?',
+  'Talk about your favorite season and what you love about it.',
+  'Describe a goal you have for the next five years.',
+  'Summarize a piece of news you read recently in your own words.',
+  'Talk about a hobby you enjoy and how you got started.',
+  'What advice would you give to your younger self?',
+  'Describe a tradition or holiday that is important to your family.',
+  'Talk about the last thing that made you laugh.',
+  'If you won the lottery tomorrow, what would you do first?',
+  'Describe a place where you feel most relaxed.',
+  'Talk about a teacher or mentor who influenced your life.',
+  'What is something you changed your mind about recently?',
+  'Describe your favorite way to spend a rainy day.',
+  'Talk about a goal you achieved that you are proud of.',
+  'If you could master one language instantly, which would it be and why?'
+];
+
+function getDailyTopic() {
+  // Pick a topic based on the day of the year so everyone gets the same one each day
+  const dayOfYear = parseInt(moment().tz(TIMEZONE).format('DDD'), 10);
+  return SPEAKING_TOPICS[dayOfYear % SPEAKING_TOPICS.length];
+}
+
+// Core call to Ollama Cloud. Returns the assistant's text, or null on any failure
+// (missing key, timeout, HTTP error, network) so callers can degrade gracefully.
+async function callOllama(messages, timeoutMs = 25000) {
+  if (!OLLAMA_API_KEY) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch('https://ollama.com/api/chat', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OLLAMA_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ model: AI_MODEL, stream: false, messages }),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      console.error(`[AI] request failed: HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const text = (data && data.message && data.message.content || '').trim();
+    return text || null;
+  } catch (err) {
+    console.error('[AI] request error:', err.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Generate a fresh speaking topic. Returns null on failure so callers fall back to the static list.
+async function generateAITopic() {
+  const text = await callOllama([
+    {
+      role: 'system',
+      content: 'You create short, engaging English speaking-practice prompts for language learners preparing a 5-minute monologue.'
+    },
+    {
+      role: 'user',
+      content: 'Give me ONE fresh, interesting English speaking-practice topic. Return only the topic as a single sentence — no numbering, no quotation marks, no extra text.'
+    }
+  ], 20000);
+  if (!text) return null;
+  // Strip wrapping quotes or a leading list marker if the model added them
+  return text.replace(/^["'\s\-\d.)]+/, '').replace(/["']+$/, '').trim() || null;
+}
+
+// Get a topic: try AI first, fall back to the deterministic static list.
+async function suggestTopic() {
+  const aiTopic = await generateAITopic();
+  return { topic: aiTopic || getDailyTopic(), fromAI: !!aiTopic };
+}
+
+// Answer a free-form question from a user. Returns null on failure.
+async function askAI(question) {
+  return callOllama([
+    {
+      role: 'system',
+      content: 'You are a friendly English-learning assistant inside a Telegram bot. Help users practice English: answer questions, explain grammar and vocabulary, correct mistakes, and give examples. Keep answers clear and concise (a few short paragraphs at most) since they are read on a phone.'
+    },
+    { role: 'user', content: question }
+  ], 30000);
+}
+
 // Create HTTP server for Render health checks
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -99,6 +213,19 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Health check server listening on port ${PORT}`);
 });
+
+// Self-ping every 5 minutes to prevent Render free tier from sleeping
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_URL) {
+  setInterval(() => {
+    https.get(RENDER_URL, (res) => {
+      console.log(`[keep-alive] ping ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.error('[keep-alive] ping failed:', err.message);
+    });
+  }, 5 * 60 * 1000);
+  console.log(`[keep-alive] Self-ping enabled → ${RENDER_URL} every 5 min`);
+}
 
 async function startBot() {
   const db = new DatabaseManager();
@@ -114,10 +241,13 @@ async function startBot() {
   await bot.setMyCommands([
     { command: 'start', description: 'Welcome & instructions' },
     { command: 'submit', description: 'How to submit recordings' },
+    { command: 'topic', description: "Today's speaking topic suggestion" },
+    { command: 'ask', description: 'Ask the AI an English question' },
     { command: 'mystats', description: 'Your personal statistics' },
     { command: 'streak', description: 'Check your current streak' },
     { command: 'history', description: 'View recent submissions' },
     { command: 'leaderboard', description: 'Monthly leaderboard' },
+    { command: 'penalties', description: 'Wall of shame (missed days)' },
     { command: 'myid', description: 'Get your Telegram user ID' },
     { command: 'help', description: 'Show all commands' }
   ]);
@@ -204,6 +334,68 @@ Send your recording now! 🚀
 `, { parse_mode: 'Markdown' });
     } catch (err) {
       console.error('Error in /submit:', err.message);
+    }
+  });
+
+  // Daily speaking topic (suggestion only, AI-generated when available)
+  bot.onText(/\/topic/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+      const { topic, fromAI } = await suggestTopic();
+
+      await bot.sendMessage(chatId,
+        `💡 *Speaking topic (just a suggestion):*\n\n` +
+        `_${topic}_\n\n` +
+        `This is only an idea — feel free to talk about anything you like! 🗣\n` +
+        `Then send your recording (at least 5 minutes). 🎤` +
+        (fromAI ? `\n\n🤖 _Suggested by AI — send /topic again for a new one._` : ''),
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Error in /topic:', err.message);
+    }
+  });
+
+  // Ask the AI a free-form question
+  bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const question = match[1] ? match[1].trim() : '';
+
+      if (!question) {
+        await bot.sendMessage(chatId,
+          `🤖 *Ask me anything about English!*\n\n` +
+          `Usage: \`/ask <your question>\`\n\n` +
+          `Examples:\n` +
+          `• /ask What is the difference between "since" and "for"?\n` +
+          `• /ask Correct this: He don't likes coffee\n` +
+          `• /ask Give me 5 synonyms for "happy"`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (!OLLAMA_API_KEY) {
+        await bot.sendMessage(chatId, '🤖 AI is not configured right now. Please try again later.');
+        return;
+      }
+
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
+      const answer = await askAI(question);
+
+      if (!answer) {
+        await bot.sendMessage(chatId, '⚠️ Sorry, I couldn\'t get an answer right now. Please try again in a moment.');
+        return;
+      }
+
+      // Send as plain text so arbitrary AI formatting can't break Telegram's parser.
+      // Telegram caps messages at 4096 chars, so trim if needed.
+      const reply = answer.length > 4000 ? answer.slice(0, 4000) + '…' : answer;
+      await bot.sendMessage(chatId, `🤖 ${reply}`);
+    } catch (err) {
+      console.error('Error in /ask:', err.message);
     }
   });
 
@@ -339,6 +531,48 @@ Keep up the great work! 💪
     }
   });
 
+  // Penalties — wall of shame (most missed days this month)
+  bot.onText(/\/penalties/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const users = await db.getAllActiveUsers();
+      const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
+      const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
+
+      const userStats = [];
+      for (const user of users) {
+        const penalties = await db.getUserPenalties(user.telegram_id, 100);
+        const monthPenalties = penalties.filter(p => {
+          const d = moment(p.penalty_date).format('YYYY-MM-DD');
+          return d >= startOfMonth && d <= endOfMonth;
+        });
+        userStats.push({ ...user, penaltyCount: monthPenalties.length });
+      }
+
+      const offenders = userStats
+        .filter(u => u.penaltyCount > 0)
+        .sort((a, b) => b.penaltyCount - a.penaltyCount);
+
+      let wallMsg = `🚨 *Wall of Shame - ${moment().tz(TIMEZONE).format('MMMM YYYY')}* 🚨\n`;
+      wallMsg += `_Most missed days this month_\n\n`;
+
+      if (offenders.length === 0) {
+        wallMsg += `🎉 *Spotless!* Nobody has any penalties this month. Amazing discipline, everyone! 💪`;
+      } else {
+        offenders.forEach((u, index) => {
+          const name = u.first_name || u.username || `User ${u.telegram_id}`;
+          const skulls = '💀'.repeat(Math.min(u.penaltyCount, 5));
+          wallMsg += `${index + 1}. *${name}* — ${u.penaltyCount} missed ${skulls}\n`;
+        });
+        wallMsg += `\nLet's turn those misses into streaks tomorrow! 🔥`;
+      }
+
+      await bot.sendMessage(chatId, wallMsg, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /penalties:', err.message);
+    }
+  });
+
   // Help
   bot.onText(/\/help/, async (msg) => {
     try {
@@ -351,10 +585,13 @@ Keep up the great work! 💪
 *For everyone:*
 /start - Welcome message & intro
 /submit - How to submit recordings
+/topic - Today's speaking topic suggestion
+/ask - Ask the AI an English question
 /mystats - Your personal statistics
 /streak - Check your current streak
 /history - View recent submissions
 /leaderboard - Monthly leaderboard
+/penalties - Wall of shame (missed days)
 /help - Show this message
 
 ${isAdmin(userId) ? `
@@ -365,6 +602,7 @@ ${isAdmin(userId) ? `
 /check - Check who hasn't submitted
 /deadline - Set deadline time
 /broadcast - Send message to all users
+/testai - Check if AI topic generation works
 ` : ''}
 
 *How to submit:*
@@ -401,11 +639,59 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 /penalty [user_id] - Add penalty to user
 /broadcast [message] - Broadcast to all users
 /setdeadline HH:MM - Set deadline time
+/testai - Check if AI topic generation works
 `;
 
       await bot.sendMessage(chatId, adminMsg);
     } catch (err) {
       console.error('Error in /admin:', err.message);
+    }
+  });
+
+  // Test AI topic generation (admin)
+  bot.onText(/\/testai/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+
+      if (!OLLAMA_API_KEY) {
+        await bot.sendMessage(chatId,
+          `⚙️ *AI Status: Disabled*\n\n` +
+          `No \`OLLAMA_API_KEY\` is set, so the bot uses its built-in topic list.\n\n` +
+          `Add the key in your environment to enable AI topics.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
+      const start = Date.now();
+      const aiTopic = await generateAITopic();
+      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+      if (aiTopic) {
+        await bot.sendMessage(chatId,
+          `✅ *AI is working!*\n\n` +
+          `🤖 Model: \`${AI_MODEL}\`\n` +
+          `⏱ Response time: ${elapsed}s\n\n` +
+          `*Sample topic:*\n_${aiTopic}_`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await bot.sendMessage(chatId,
+          `❌ *AI request failed* (took ${elapsed}s)\n\n` +
+          `Model \`${AI_MODEL}\` did not return a topic. The bot will fall back to its built-in list.\n\n` +
+          `Check the server logs for the exact error (bad key, rate limit, or wrong model name).`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (err) {
+      console.error('Error in /testai:', err.message);
     }
   });
 
@@ -793,7 +1079,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     } catch (err) {
       console.error('Error in reminder cron:', err.message);
     }
-  });
+  }, { timezone: TIMEZONE });
 
   // Deadline alert at 23:59
   cron.schedule('59 23 * * *', async () => {
@@ -841,7 +1127,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     } catch (err) {
       console.error('Error in deadline cron:', err.message);
     }
-  });
+  }, { timezone: TIMEZONE });
 
   // Morning motivation at 7:00
   cron.schedule('0 7 * * *', async () => {
@@ -856,16 +1142,23 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       ];
 
       const message = messages[Math.floor(Math.random() * messages.length)];
+      // One AI call per day, reused for all users (falls back to static list)
+      const { topic } = await suggestTopic();
+      const fullMessage =
+        `${message}\n\n` +
+        `💡 *Today's speaking topic (just a suggestion):*\n` +
+        `_${topic}_\n\n` +
+        `Feel free to talk about anything you like — this is only an idea to get you started! 🗣`;
 
       for (const user of users) {
         try {
-          await bot.sendMessage(user.telegram_id, message);
+          await bot.sendMessage(user.telegram_id, fullMessage, { parse_mode: 'Markdown' });
         } catch (e) {}
       }
     } catch (err) {
       console.error('Error in morning cron:', err.message);
     }
-  });
+  }, { timezone: TIMEZONE });
 
   // Weekly summary on Sunday at 20:00
   cron.schedule('0 20 * * 0', async () => {
@@ -899,7 +1192,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     } catch (err) {
       console.error('Error in weekly cron:', err.message);
     }
-  });
+  }, { timezone: TIMEZONE });
 
   // Error handling
   bot.on('polling_error', (error) => {
