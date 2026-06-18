@@ -112,16 +112,24 @@ function validateSubmission(msg) {
   return { valid: true, fileId, fileType, duration };
 }
 
-// Parse a YYMMDD day-tag (e.g. "260618" → 2026-06-18) out of a filename or
-// caption. Accepts optional - _ . / separators (260618, 26-06-18, 26_06_18).
+// Parse a day-tag out of a filename or caption. Accepts YYYYMMDD or YYMMDD with
+// optional - _ . / separators (20260618, 2026-06-18, 260618, 26-06-18).
 // Returns 'YYYY-MM-DD' or null if no valid date is present.
 function parseDateTag(text) {
   if (!text) return null;
-  const re = /(\d{2})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g;
-  let m;
-  while ((m = re.exec(String(text))) !== null) {
-    const iso = `20${m[1]}-${m[2]}-${m[3]}`;
-    if (moment(iso, 'YYYY-MM-DD', true).isValid()) return iso;
+  const s = String(text);
+  // Try full-year (YYYYMMDD) first so an 8-digit tag isn't mis-read as YY-MM-DD,
+  // then 2-digit-year (YYMMDD). Optional - _ . / separators in both.
+  const patterns = [
+    { re: /(\d{4})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g, year: m => m[1] },
+    { re: /(\d{2})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g, year: m => `20${m[1]}` }
+  ];
+  for (const p of patterns) {
+    let m;
+    while ((m = p.re.exec(s)) !== null) {
+      const iso = `${p.year(m)}-${m[2]}-${m[3]}`;
+      if (moment(iso, 'YYYY-MM-DD', true).isValid()) return iso;
+    }
   }
   return null;
 }
@@ -391,13 +399,13 @@ Let's practice English every day! 🚀
 
 Send an *audio file, voice message, or video* — but it *must carry a date* so I know which day it counts for.
 
-*Name the file (or add a caption) ending in the date as YYMMDD:*
-\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`
+*Name the file (or add a caption) ending in the date — YYMMDD or YYYYMMDD both work:*
+\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`  or  \`yourname_${moment().tz(TIMEZONE).format('YYYYMMDD')}\`
 
 *Requirements:*
 ⏱ Minimum *5 minutes* long
 🗣 Speak in English
-🏷 Must include the *YYMMDD* date tag
+🏷 Must include the date tag (*YYMMDD* or *YYYYMMDD*)
 📅 One recording per day
 
 *Make-ups:* You can submit for *today or the last 2 days* — just use that day's date (e.g. send two files \`name_${moment().tz(TIMEZONE).subtract(1,'day').format('YYMMDD')}\` and \`name_${moment().tz(TIMEZONE).format('YYMMDD')}\` together).
@@ -1211,8 +1219,8 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       if (!submissionDate) {
         await bot.sendMessage(chatId,
           `❌ I couldn't find a date on this recording.\n\n` +
-          `Please name the file (or add a caption) ending in the date as *YYMMDD*:\n` +
-          `\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`\n\n` +
+          `Please name the file (or add a caption) ending in the date — *YYMMDD* or *YYYYMMDD*:\n` +
+          `\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`  or  \`yourname_${moment().tz(TIMEZONE).format('YYYYMMDD')}\`\n\n` +
           `That tells me which day it counts for.`,
           { parse_mode: 'Markdown', ...replyOpts });
         return;
