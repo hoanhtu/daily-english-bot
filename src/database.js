@@ -106,13 +106,59 @@ class DatabaseManager {
     await this.run('UPDATE users SET is_active = 0 WHERE telegram_id = $1', [telegramId]);
   }
 
-  async recordSubmission(userId, fileId, fileType, duration, caption, date) {
+  // ===== Group / membership tracking =====
+
+  async registerGroup(chatId, title) {
+    await this.run(`
+      INSERT INTO groups (chat_id, title, is_active) VALUES ($1, $2, 1)
+      ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title, is_active = 1
+    `, [chatId, title || null]);
+  }
+
+  async getAllGroups() {
+    return this.queryAll('SELECT * FROM groups WHERE is_active = 1');
+  }
+
+  async registerGroupMember(chatId, telegramId) {
+    await this.run(`
+      INSERT INTO group_members (chat_id, telegram_id, is_active) VALUES ($1, $2, 1)
+      ON CONFLICT (chat_id, telegram_id) DO UPDATE SET is_active = 1
+    `, [chatId, telegramId]);
+  }
+
+  // Active members of a scope. For a group this is its tracked members; for a
+  // private chat (chat_id > 0, equal to the user's id) it's just that user.
+  async getScopeMembers(chatId) {
+    return this.queryAll(`
+      SELECT u.* FROM users u
+      JOIN (
+        SELECT telegram_id FROM group_members WHERE chat_id = $1 AND is_active = 1
+        UNION
+        SELECT $1::bigint AS telegram_id WHERE $1 > 0
+      ) m ON u.telegram_id = m.telegram_id
+      WHERE u.is_active = 1
+    `, [chatId]);
+  }
+
+  // Users who have at least one submission in their own 1:1 chat.
+  async getPrivateParticipants() {
+    return this.queryAll(`
+      SELECT u.* FROM users u
+      WHERE u.is_active = 1
+        AND EXISTS (
+          SELECT 1 FROM submissions s
+          WHERE s.user_id = u.telegram_id AND s.chat_id = u.telegram_id AND s.is_valid = 1
+        )
+    `);
+  }
+
+  async recordSubmission(userId, chatId, fileId, fileType, duration, caption, date) {
     const timezone = process.env.TIMEZONE || 'Asia/Saigon';
     const today = moment().tz(timezone).format('YYYY-MM-DD');
 
     const existing = await this.queryOne(
-      'SELECT id FROM submissions WHERE user_id = $1 AND submission_date = $2 AND is_valid = 1',
-      [userId, date]
+      'SELECT id FROM submissions WHERE user_id = $1 AND chat_id = $2 AND submission_date = $3 AND is_valid = 1',
+      [userId, chatId, date]
     );
 
     if (existing) {
@@ -120,106 +166,117 @@ class DatabaseManager {
     }
 
     await this.run(
-      'INSERT INTO submissions (user_id, submission_date, file_id, file_type, duration, caption) VALUES ($1, $2, $3, $4, $5, $6)',
-      [userId, date, fileId, fileType, duration || 0, caption || null]
+      'INSERT INTO submissions (user_id, chat_id, submission_date, file_id, file_type, duration, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [userId, chatId, date, fileId, fileType, duration || 0, caption || null]
     );
 
-    // Auto-penalty: check if yesterday was missed
+    // Auto-penalty: if yesterday was missed in THIS scope. Only applies to
+    // established participants (someone with an earlier submission in this scope)
+    // so a brand-new group member isn't penalised on their first submission.
     const yesterday = moment().tz(timezone).subtract(1, 'day').format('YYYY-MM-DD');
     const yesterdaySub = await this.queryOne(
-      'SELECT id FROM submissions WHERE user_id = $1 AND submission_date = $2 AND is_valid = 1',
-      [userId, yesterday]
+      'SELECT id FROM submissions WHERE user_id = $1 AND chat_id = $2 AND submission_date = $3 AND is_valid = 1',
+      [userId, chatId, yesterday]
     );
 
     if (!yesterdaySub && date === today) {
-      const existingPenalty = await this.queryOne(
-        'SELECT id FROM penalties WHERE user_id = $1 AND penalty_date = $2',
-        [userId, yesterday]
+      const priorSub = await this.queryOne(
+        'SELECT id FROM submissions WHERE user_id = $1 AND chat_id = $2 AND submission_date < $3 AND is_valid = 1 LIMIT 1',
+        [userId, chatId, date]
       );
-      if (!existingPenalty) {
-        await this.run(
-          'INSERT INTO penalties (user_id, penalty_date, reason) VALUES ($1, $2, $3)',
-          [userId, yesterday, 'Missed daily submission']
+      if (priorSub) {
+        const existingPenalty = await this.queryOne(
+          'SELECT id FROM penalties WHERE user_id = $1 AND chat_id = $2 AND penalty_date = $3',
+          [userId, chatId, yesterday]
         );
-        return { success: true, message: 'Submission recorded! ⚠️ You missed yesterday so a penalty was added.' };
+        if (!existingPenalty) {
+          await this.run(
+            'INSERT INTO penalties (user_id, chat_id, penalty_date, reason) VALUES ($1, $2, $3, $4)',
+            [userId, chatId, yesterday, 'Missed daily submission']
+          );
+          return { success: true, message: 'Submission recorded! ⚠️ You missed yesterday so a penalty was added.' };
+        }
       }
     }
 
     return { success: true, message: 'Submission recorded successfully!' };
   }
 
-  async getTodaySubmissions(date) {
+  async getTodaySubmissions(chatId, date) {
     return this.queryAll(`
       SELECT s.*, u.username, u.first_name, u.last_name
       FROM submissions s
       JOIN users u ON s.user_id = u.telegram_id
-      WHERE s.submission_date = $1 AND s.is_valid = 1
+      WHERE s.chat_id = $1 AND s.submission_date = $2 AND s.is_valid = 1
       ORDER BY s.submitted_at ASC
-    `, [date]);
+    `, [chatId, date]);
   }
 
-  async getUserSubmissions(userId, limit = 30) {
+  async getUserSubmissions(userId, chatId, limit = 30) {
     return this.queryAll(`
-      SELECT * FROM submissions 
-      WHERE user_id = $1 AND is_valid = 1
+      SELECT * FROM submissions
+      WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1
       ORDER BY submission_date DESC
-      LIMIT $2
-    `, [userId, limit]);
+      LIMIT $3
+    `, [userId, chatId, limit]);
   }
 
-  async getSubmissionsInRange(userId, startDate, endDate) {
+  async getSubmissionsInRange(userId, chatId, startDate, endDate) {
     return this.queryAll(`
       SELECT submission_date::text as submission_date FROM submissions
-      WHERE user_id = $1 AND submission_date >= $2 AND submission_date <= $3 AND is_valid = 1
+      WHERE user_id = $1 AND chat_id = $2 AND submission_date >= $3 AND submission_date <= $4 AND is_valid = 1
       ORDER BY submission_date
-    `, [userId, startDate, endDate]);
+    `, [userId, chatId, startDate, endDate]);
   }
 
-  async getSubmissionCountForDate(userId, date) {
+  async getSubmissionCountForDate(userId, chatId, date) {
     const row = await this.queryOne(`
       SELECT COUNT(*) as count FROM submissions
-      WHERE user_id = $1 AND submission_date = $2 AND is_valid = 1
-    `, [userId, date]);
+      WHERE user_id = $1 AND chat_id = $2 AND submission_date = $3 AND is_valid = 1
+    `, [userId, chatId, date]);
     return row ? parseInt(row.count) : 0;
   }
 
-  async addPenalty(userId, penaltyDate, reason) {
+  async addPenalty(userId, chatId, penaltyDate, reason) {
     await this.run(
-      'INSERT INTO penalties (user_id, penalty_date, reason) VALUES ($1, $2, $3)',
-      [userId, penaltyDate, reason]
+      'INSERT INTO penalties (user_id, chat_id, penalty_date, reason) VALUES ($1, $2, $3, $4)',
+      [userId, chatId, penaltyDate, reason]
     );
   }
 
-  async getUserPenalties(userId, limit = 20) {
+  async getUserPenalties(userId, chatId, limit = 20) {
     return this.queryAll(`
-      SELECT * FROM penalties 
-      WHERE user_id = $1
+      SELECT * FROM penalties
+      WHERE user_id = $1 AND chat_id = $2
       ORDER BY penalty_date DESC
-      LIMIT $2
-    `, [userId, limit]);
+      LIMIT $3
+    `, [userId, chatId, limit]);
   }
 
-  async getPenaltyCount(userId) {
-    const row = await this.queryOne('SELECT COUNT(*) as count FROM penalties WHERE user_id = $1', [userId]);
+  async getPenaltyCount(userId, chatId) {
+    const row = await this.queryOne(
+      'SELECT COUNT(*) as count FROM penalties WHERE user_id = $1 AND chat_id = $2',
+      [userId, chatId]
+    );
     return row ? parseInt(row.count) : 0;
   }
 
-  async getUserStats(userId) {
+  async getUserStats(userId, chatId) {
     const totalSubmissions = await this.queryOne(`
-      SELECT COUNT(*) as count FROM submissions 
-      WHERE user_id = $1 AND is_valid = 1
-    `, [userId]);
-    
-    const count = totalSubmissions ? parseInt(totalSubmissions.count) : 0;
-    const totalPenalties = await this.getPenaltyCount(userId);
-    
-    const lastSubmission = await this.queryOne(`
-      SELECT submission_date::text as submission_date FROM submissions 
-      WHERE user_id = $1 AND is_valid = 1
-      ORDER BY submission_date DESC LIMIT 1
-    `, [userId]);
+      SELECT COUNT(*) as count FROM submissions
+      WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1
+    `, [userId, chatId]);
 
-    const currentStreak = await this.calculateStreak(userId);
+    const count = totalSubmissions ? parseInt(totalSubmissions.count) : 0;
+    const totalPenalties = await this.getPenaltyCount(userId, chatId);
+
+    const lastSubmission = await this.queryOne(`
+      SELECT submission_date::text as submission_date FROM submissions
+      WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1
+      ORDER BY submission_date DESC LIMIT 1
+    `, [userId, chatId]);
+
+    const currentStreak = await this.calculateStreak(userId, chatId);
 
     return {
       totalSubmissions: count,
@@ -229,12 +286,12 @@ class DatabaseManager {
     };
   }
 
-  async calculateStreak(userId) {
+  async calculateStreak(userId, chatId) {
     const submissions = await this.queryAll(`
       SELECT submission_date::text as submission_date FROM submissions
-      WHERE user_id = $1 AND is_valid = 1
+      WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1
       ORDER BY submission_date DESC
-    `, [userId]);
+    `, [userId, chatId]);
 
     if (submissions.length === 0) return 0;
 
@@ -254,9 +311,10 @@ class DatabaseManager {
     return streak;
   }
 
-  async getAllUsersWithTodayStatus(today) {
+  // Members of a scope with their submission/penalty status for `today`.
+  async getAllUsersWithTodayStatus(chatId, today) {
     return this.queryAll(`
-      SELECT 
+      SELECT
         u.telegram_id,
         u.username,
         u.first_name,
@@ -269,13 +327,18 @@ class DatabaseManager {
         s.submitted_at,
         p.id as penalty_id
       FROM users u
-      LEFT JOIN submissions s ON u.telegram_id = s.user_id 
-        AND s.submission_date = $1 AND s.is_valid = 1
-      LEFT JOIN penalties p ON u.telegram_id = p.user_id 
-        AND p.penalty_date = $2
+      JOIN (
+        SELECT telegram_id FROM group_members WHERE chat_id = $1 AND is_active = 1
+        UNION
+        SELECT $1::bigint AS telegram_id WHERE $1 > 0
+      ) m ON u.telegram_id = m.telegram_id
+      LEFT JOIN submissions s ON u.telegram_id = s.user_id
+        AND s.chat_id = $1 AND s.submission_date = $2 AND s.is_valid = 1
+      LEFT JOIN penalties p ON u.telegram_id = p.user_id
+        AND p.chat_id = $1 AND p.penalty_date = $2
       WHERE u.is_active = 1
       ORDER BY u.first_name ASC, u.username ASC
-    `, [today, today]);
+    `, [chatId, today]);
   }
 
   async close() {

@@ -253,6 +253,28 @@ async function startBot() {
   ]);
   console.log('✅ Command suggestions registered');
 
+  // A "scope" is the world a message belongs to:
+  //   - group/supergroup -> the group's chat id (negative)
+  //   - private 1:1 chat  -> msg.chat.id, which equals the user's own id (positive)
+  // Every submission/penalty/query is scoped by this chat id so each group is
+  // independent and 1:1 practice stays personal.
+  function isGroupChat(msg) {
+    return msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  }
+
+  // Remember which users participate in which group. Fires for every message
+  // (needs Privacy Mode OFF or the bot to be a group admin to see them all).
+  bot.on('message', async (msg) => {
+    try {
+      if (!msg.from || !isGroupChat(msg)) return;
+      await db.registerGroup(msg.chat.id, msg.chat.title || null);
+      await db.registerUser(msg.from.id, msg.from.username, msg.from.first_name, msg.from.last_name);
+      await db.registerGroupMember(msg.chat.id, msg.from.id);
+    } catch (e) {
+      console.error('Error tracking group member:', e.message);
+    }
+  });
+
   // ===== COMMAND HANDLERS =====
 
   // Start command
@@ -406,15 +428,15 @@ Send your recording now! 🚀
       const userId = msg.from.id;
 
       await db.registerUser(userId, msg.from.username, msg.from.first_name, msg.from.last_name);
-      const stats = await db.getUserStats(userId);
+      const stats = await db.getUserStats(userId, chatId);
       const user = await db.getUser(userId);
 
       const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
       const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
-      const monthSubmissions = await db.getSubmissionsInRange(userId, startOfMonth, endOfMonth);
+      const monthSubmissions = await db.getSubmissionsInRange(userId, chatId, startOfMonth, endOfMonth);
 
       const statsMsg = `
-📊 *Your Statistics* 📊
+📊 *Your Statistics${isGroupChat(msg) ? ' (this group)' : ''}* 📊
 
 👤 *${formatUserDisplay(user)}*
 
@@ -439,7 +461,7 @@ Keep up the great work! 💪
       const chatId = msg.chat.id;
       const userId = msg.from.id;
 
-      const streak = await db.calculateStreak(userId);
+      const streak = await db.calculateStreak(userId, chatId);
 
       let message = '';
       if (streak === 0) {
@@ -466,7 +488,7 @@ Keep up the great work! 💪
       const chatId = msg.chat.id;
       const userId = msg.from.id;
 
-      const submissions = await db.getUserSubmissions(userId, 15);
+      const submissions = await db.getUserSubmissions(userId, chatId, 15);
 
       if (submissions.length === 0) {
         await bot.sendMessage(chatId, '📭 No submissions found. Start by sending your first recording!');
@@ -492,21 +514,21 @@ Keep up the great work! 💪
   bot.onText(/\/leaderboard/, async (m) => {
     try {
       const chatId = m.chat.id;
-      const users = await db.getAllActiveUsers();
+      const users = await db.getScopeMembers(chatId);
       const today = getToday();
       const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
       const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
 
       const userStats = [];
       for (const user of users) {
-        const monthSubs = await db.getSubmissionsInRange(user.telegram_id, startOfMonth, endOfMonth);
-        const streak = await db.calculateStreak(user.telegram_id);
+        const monthSubs = await db.getSubmissionsInRange(user.telegram_id, chatId, startOfMonth, endOfMonth);
+        const streak = await db.calculateStreak(user.telegram_id, chatId);
         userStats.push({ ...user, monthCount: monthSubs.length, streak });
       }
 
       userStats.sort((a, b) => b.monthCount - a.monthCount || b.streak - a.streak);
 
-      const todaySubmissions = await db.getTodaySubmissions(today);
+      const todaySubmissions = await db.getTodaySubmissions(chatId, today);
 
       let leaderboardMsg = `🏆 *Leaderboard - ${moment().tz(TIMEZONE).format('MMMM YYYY')}* 🏆\n\n`;
       leaderboardMsg += `📅 Today: ${todaySubmissions.length}/${users.length} submitted\n\n`;
@@ -535,13 +557,13 @@ Keep up the great work! 💪
   bot.onText(/\/penalties/, async (msg) => {
     try {
       const chatId = msg.chat.id;
-      const users = await db.getAllActiveUsers();
+      const users = await db.getScopeMembers(chatId);
       const startOfMonth = moment().tz(TIMEZONE).startOf('month').format('YYYY-MM-DD');
       const endOfMonth = moment().tz(TIMEZONE).endOf('month').format('YYYY-MM-DD');
 
       const userStats = [];
       for (const user of users) {
-        const penalties = await db.getUserPenalties(user.telegram_id, 100);
+        const penalties = await db.getUserPenalties(user.telegram_id, chatId, 100);
         const monthPenalties = penalties.filter(p => {
           const d = moment(p.penalty_date).format('YYYY-MM-DD');
           return d >= startOfMonth && d <= endOfMonth;
@@ -707,7 +729,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
 
       const today = getToday();
-      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const usersStatus = await db.getAllUsersWithTodayStatus(chatId, today);
 
       const submitted = usersStatus.filter(u => u.submission_id);
       const notSubmitted = usersStatus.filter(u => !u.submission_id);
@@ -754,8 +776,8 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
 
       const today = getToday();
-      const usersStatus = await db.getAllUsersWithTodayStatus(today);
-      const allUsers = await db.getAllActiveUsers();
+      const usersStatus = await db.getAllUsersWithTodayStatus(chatId, today);
+      const allUsers = await db.getScopeMembers(chatId);
 
       const submitted = usersStatus.filter(u => u.submission_id);
       const notSubmitted = usersStatus.filter(u => !u.submission_id);
@@ -795,10 +817,10 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       reportMsg += `*📆 Monthly Summary (Days ${daysInMonth}):*\n`;
       const sortedUsers = [];
       for (const u of allUsers) {
-        const monthSubs = await db.getSubmissionsInRange(u.telegram_id, startOfMonth, endOfMonth);
-        const penalties = await db.getUserPenalties(u.telegram_id);
+        const monthSubs = await db.getSubmissionsInRange(u.telegram_id, chatId, startOfMonth, endOfMonth);
+        const penalties = await db.getUserPenalties(u.telegram_id, chatId, 100);
         const monthPenalties = penalties.filter(p => p.penalty_date >= startOfMonth && p.penalty_date <= endOfMonth);
-        const streak = await db.calculateStreak(u.telegram_id);
+        const streak = await db.calculateStreak(u.telegram_id, chatId);
         sortedUsers.push({ ...u, monthCount: monthSubs.length, penaltyCount: monthPenalties.length, streak });
       }
       sortedUsers.sort((a, b) => b.monthCount - a.monthCount);
@@ -831,7 +853,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
 
       const today = getToday();
-      const usersStatus = await db.getAllUsersWithTodayStatus(today);
+      const usersStatus = await db.getAllUsersWithTodayStatus(chatId, today);
       const notSubmitted = usersStatus.filter(u => !u.submission_id);
 
       if (notSubmitted.length === 0) {
@@ -867,7 +889,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
       if (!targetUserId) {
         const today = getToday();
-        const usersStatus = await db.getAllUsersWithTodayStatus(today);
+        const usersStatus = await db.getAllUsersWithTodayStatus(chatId, today);
         const notSubmitted = usersStatus.filter(u => !u.submission_id);
 
         if (notSubmitted.length === 0) {
@@ -891,10 +913,10 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
 
       const today = getToday();
-      await db.addPenalty(targetUserId, today, 'Missed daily submission');
+      await db.addPenalty(targetUserId, chatId, today, 'Missed daily submission');
 
       const name = formatUserDisplay(user);
-      await bot.sendMessage(chatId, `⚠️ Penalty added to ${name} for missing today's submission.`);
+      await bot.sendMessage(chatId, `⚠️ Penalty added to ${name} for missing today's submission${isGroupChat(msg) ? ' in this group' : ''}.`);
     } catch (err) {
       console.error('Error in /penalty:', err.message);
     }
@@ -977,19 +999,31 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
       await db.registerUser(userId, username, firstName, lastName);
 
+      // In groups/supergroups, reply directly to the submitter's recording so it's
+      // clear whose submission was counted when several people post at once.
+      const isGroup = isGroupChat(msg);
+      const replyOpts = isGroup ? { reply_to_message_id: msg.message_id } : {};
+
+      // Make sure this person counts as a member of this group's tracker.
+      if (isGroup) {
+        await db.registerGroup(chatId, msg.chat.title || null);
+        await db.registerGroupMember(chatId, userId);
+      }
+
       const validation = validateSubmission(msg);
 
       if (!validation.valid) {
         if (validation.reason === 'no_media') {
           return;
         }
-        await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 5 minutes.`);
+        await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 5 minutes.`, replyOpts);
         return;
       }
 
       const today = getToday();
       const result = await db.recordSubmission(
         userId,
+        chatId,
         validation.fileId,
         validation.fileType,
         validation.duration,
@@ -1002,7 +1036,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
           ? `(${Math.floor(validation.duration / 60)}m ${validation.duration % 60}s)`
           : '';
 
-        const streak = await db.calculateStreak(userId);
+        const streak = await db.calculateStreak(userId, chatId);
         let streakMsg = '';
         if (streak > 0) {
           if (streak === 1) streakMsg = '\n🔥 Streak started! Day 1!';
@@ -1013,27 +1047,30 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         const typeEmoji = validation.fileType === 'voice' ? '🎤' :
                           validation.fileType === 'video' ? '📹' : '🎵';
 
+        const user = await db.getUser(userId);
+        const userName = formatUserDisplay(user);
+
         await bot.sendMessage(chatId,
           `✅ *Submission Recorded!* ${typeEmoji}\n` +
+          (isGroup ? `👤 ${userName}\n` : '') +
           `📅 ${today}\n` +
           `⏱ ${durationStr}${streakMsg}\n\n` +
           `Keep up the great work! 🚀\n` +
           `Check your stats with /mystats`,
-          { parse_mode: 'Markdown' }
+          { parse_mode: 'Markdown', ...replyOpts }
         );
 
-        const user = await db.getUser(userId);
-        const userName = formatUserDisplay(user);
+        const scopeLine = isGroup ? `\n👥 ${msg.chat.title || 'Group'}` : '\n💬 Private chat';
         for (const adminId of ADMIN_IDS) {
           try {
             await bot.sendMessage(adminId,
-              `✅ *Submission Received*\n👤 ${userName}\n📅 ${today}\n⏱ ${durationStr}${streakMsg}`,
+              `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${today}\n⏱ ${durationStr}${streakMsg}`,
               { parse_mode: 'Markdown' }
             );
           } catch (e) {}
         }
       } else {
-        await bot.sendMessage(chatId, `⚠️ ${result.message}\n\nYou can view your stats with /mystats`);
+        await bot.sendMessage(chatId, `⚠️ ${result.message}\n\nYou can view your stats with /mystats`, replyOpts);
       }
     } catch (err) {
       console.error('Error in handleMediaSubmission:', err.message);
@@ -1048,30 +1085,44 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
   // ===== SCHEDULED TASKS =====
 
-  // Reminder at 22:00 (10 PM) daily
+  // Reminder at 22:00 (10 PM) daily — posted per group, plus DMs for 1:1 users
   cron.schedule('0 22 * * *', async () => {
     try {
       const today = getToday();
-      const usersStatus = await db.getAllUsersWithTodayStatus(today);
-      const notSubmitted = usersStatus.filter(u => !u.submission_id);
+      const groups = await db.getAllGroups();
 
-      if (notSubmitted.length === 0) return;
+      for (const g of groups) {
+        const usersStatus = await db.getAllUsersWithTodayStatus(g.chat_id, today);
+        const notSubmitted = usersStatus.filter(u => !u.submission_id);
+        if (notSubmitted.length === 0) continue;
 
-      for (const u of notSubmitted) {
-        const name = u.first_name || 'there';
+        const names = notSubmitted.map(u => u.first_name || u.username || `User ${u.telegram_id}`).join(', ');
         try {
-          await bot.sendMessage(u.telegram_id,
-            `⏰ *Reminder!*\n\nHey ${name}! Don't forget to submit your daily English recording today! 🎤\n\nDeadline: ${getDeadlineTime()}\n\nSend your recording now! 🚀`,
+          await bot.sendMessage(g.chat_id,
+            `⏰ *Daily Reminder!*\n\nStill waiting on: ${names}\n\n🎤 Send your recording (5+ min) before ${getDeadlineTime()}!`,
             { parse_mode: 'Markdown' }
           );
         } catch (e) {}
+
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.sendMessage(adminId,
+              `⏰ *${g.title || 'Group'}* — ${notSubmitted.length} pending\n${names}`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (e) {}
+        }
       }
 
-      const names = notSubmitted.map(u => u.first_name || u.username || `User ${u.telegram_id}`).join(', ');
-      for (const adminId of ADMIN_IDS) {
+      // Personal 1:1 reminders
+      const privateUsers = await db.getPrivateParticipants();
+      for (const u of privateUsers) {
+        const submittedToday = await db.getSubmissionCountForDate(u.telegram_id, u.telegram_id, today);
+        if (submittedToday > 0) continue;
+        const name = u.first_name || 'there';
         try {
-          await bot.sendMessage(adminId,
-            `⏰ *Reminder sent to ${notSubmitted.length} users*\n\nPending: ${names}`,
+          await bot.sendMessage(u.telegram_id,
+            `⏰ *Reminder!*\n\nHey ${name}! Don't forget your daily English recording! 🎤\n\nDeadline: ${getDeadlineTime()}`,
             { parse_mode: 'Markdown' }
           );
         } catch (e) {}
@@ -1081,45 +1132,56 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Deadline alert at 23:59
+  // Deadline alert at 23:59 — per group, plus DMs for 1:1 users
   cron.schedule('59 23 * * *', async () => {
     try {
       const today = getToday();
-      const usersStatus = await db.getAllUsersWithTodayStatus(today);
-      const notSubmitted = usersStatus.filter(u => !u.submission_id);
+      const groups = await db.getAllGroups();
 
-      if (notSubmitted.length === 0) {
-        for (const adminId of ADMIN_IDS) {
+      for (const g of groups) {
+        const usersStatus = await db.getAllUsersWithTodayStatus(g.chat_id, today);
+        const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+        if (notSubmitted.length === 0) {
           try {
-            await bot.sendMessage(adminId,
-              `🎉 *All clear!* Everyone submitted today!\n📅 ${today}`,
+            await bot.sendMessage(g.chat_id,
+              `🎉 *All clear!* Everyone in this group submitted today! 📅 ${today}`,
               { parse_mode: 'Markdown' }
             );
           } catch (e) {}
+          continue;
         }
-        return;
-      }
 
-      let reportMsg = `⛔ *Deadline Reached - ${today}*\n\n`;
-      reportMsg += `Missing submissions: *${notSubmitted.length}*\n\n`;
-      reportMsg += `*Need to add penalties:*\n`;
-      notSubmitted.forEach((u, i) => {
-        const name = formatUserDisplay(u);
-        reportMsg += `${i + 1}. ${name}\n`;
-        reportMsg += `   -> Use: /penalty ${u.telegram_id}\n`;
-      });
-
-      for (const adminId of ADMIN_IDS) {
+        const names = notSubmitted.map(u => formatUserDisplay(u)).join(', ');
         try {
-          await bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
+          await bot.sendMessage(g.chat_id,
+            `⛔ *Deadline reached - ${today}*\n\nMissed today (${notSubmitted.length}): ${names}\n\nStart fresh tomorrow! 💪`,
+            { parse_mode: 'Markdown' }
+          );
         } catch (e) {}
+
+        // Admins get penalty hints. NOTE: run /penalty inside this group so it
+        // applies to the right scope.
+        let reportMsg = `⛔ *${g.title || 'Group'} - ${today}* (run /penalty in the group)\nMissing: *${notSubmitted.length}*\n\n`;
+        notSubmitted.forEach((u, i) => {
+          reportMsg += `${i + 1}. ${formatUserDisplay(u)} → /penalty ${u.telegram_id}\n`;
+        });
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
+          } catch (e) {}
+        }
       }
 
-      for (const u of notSubmitted) {
+      // Personal 1:1 deadline notices
+      const privateUsers = await db.getPrivateParticipants();
+      for (const u of privateUsers) {
+        const submittedToday = await db.getSubmissionCountForDate(u.telegram_id, u.telegram_id, today);
+        if (submittedToday > 0) continue;
         const name = u.first_name || 'there';
         try {
           await bot.sendMessage(u.telegram_id,
-            `⛔ *Deadline Missed!*\n\nHey ${name}, you didn't submit your English recording today.\n\nDon't worry - start fresh tomorrow! Every day is a new opportunity! 💪`,
+            `⛔ *Deadline Missed!*\n\nHey ${name}, you didn't submit your English recording today.\n\nDon't worry - start fresh tomorrow! 💪`,
             { parse_mode: 'Markdown' }
           );
         } catch (e) {}
@@ -1129,10 +1191,9 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Morning motivation at 7:00
+  // Morning motivation at 7:00 — posted to every group and DM'd to 1:1 users
   cron.schedule('0 7 * * *', async () => {
     try {
-      const users = await db.getAllActiveUsers();
       const messages = [
         '🌅 Good morning! Ready to practice your English today? 🎤',
         '☀️ New day, new opportunity! Don\'t forget your English recording! 🚀',
@@ -1142,7 +1203,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       ];
 
       const message = messages[Math.floor(Math.random() * messages.length)];
-      // One AI call per day, reused for all users (falls back to static list)
+      // One AI call per day, reused everywhere (falls back to static list)
       const { topic } = await suggestTopic();
       const fullMessage =
         `${message}\n\n` +
@@ -1150,9 +1211,17 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         `_${topic}_\n\n` +
         `Feel free to talk about anything you like — this is only an idea to get you started! 🗣`;
 
-      for (const user of users) {
+      const groups = await db.getAllGroups();
+      for (const g of groups) {
         try {
-          await bot.sendMessage(user.telegram_id, fullMessage, { parse_mode: 'Markdown' });
+          await bot.sendMessage(g.chat_id, fullMessage, { parse_mode: 'Markdown' });
+        } catch (e) {}
+      }
+
+      const privateUsers = await db.getPrivateParticipants();
+      for (const u of privateUsers) {
+        try {
+          await bot.sendMessage(u.telegram_id, fullMessage, { parse_mode: 'Markdown' });
         } catch (e) {}
       }
     } catch (err) {
@@ -1160,17 +1229,43 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Weekly summary on Sunday at 20:00
+  // Weekly summary on Sunday at 20:00 — group leaderboard in each group, personal DM for 1:1 users
   cron.schedule('0 20 * * 0', async () => {
     try {
-      const users = await db.getAllActiveUsers();
       const endDate = getToday();
       const startDate = moment().tz(TIMEZONE).subtract(7, 'days').format('YYYY-MM-DD');
 
-      for (const user of users) {
-        const weekSubs = await db.getSubmissionsInRange(user.telegram_id, startDate, endDate);
-        const streak = await db.calculateStreak(user.telegram_id);
-        const name = user.first_name || 'there';
+      // Per-group weekly recap
+      const groups = await db.getAllGroups();
+      for (const g of groups) {
+        const members = await db.getScopeMembers(g.chat_id);
+        const rows = [];
+        for (const u of members) {
+          const weekSubs = await db.getSubmissionsInRange(u.telegram_id, g.chat_id, startDate, endDate);
+          const streak = await db.calculateStreak(u.telegram_id, g.chat_id);
+          rows.push({ name: u.first_name || u.username || `User ${u.telegram_id}`, count: weekSubs.length, streak });
+        }
+        if (rows.length === 0) continue;
+        rows.sort((a, b) => b.count - a.count || b.streak - a.streak);
+
+        let msg = `📊 *Weekly Summary - ${g.title || 'Group'}*\n\n`;
+        rows.forEach((r, i) => {
+          msg += `${i + 1}. ${r.name}: ${r.count}/7 days`;
+          if (r.streak > 0) msg += ` 🔥${r.streak}d`;
+          msg += `\n`;
+        });
+        msg += `\nKeep practicing every day! 💪`;
+        try {
+          await bot.sendMessage(g.chat_id, msg, { parse_mode: 'Markdown' });
+        } catch (e) {}
+      }
+
+      // Personal weekly summary for 1:1 participants
+      const privateUsers = await db.getPrivateParticipants();
+      for (const u of privateUsers) {
+        const weekSubs = await db.getSubmissionsInRange(u.telegram_id, u.telegram_id, startDate, endDate);
+        const streak = await db.calculateStreak(u.telegram_id, u.telegram_id);
+        const name = u.first_name || 'there';
 
         let msg = `📊 *Weekly Summary*\n\n`;
         msg += `Hey ${name}! Here's your progress this week:\n\n`;
@@ -1186,7 +1281,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         }
 
         try {
-          await bot.sendMessage(user.telegram_id, msg, { parse_mode: 'Markdown' });
+          await bot.sendMessage(u.telegram_id, msg, { parse_mode: 'Markdown' });
         } catch (e) {}
       }
     } catch (err) {
