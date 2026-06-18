@@ -16,6 +16,15 @@ const PORT = process.env.PORT || 10000;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
 const AI_MODEL = process.env.AI_MODEL || 'gpt-oss:120b';
 
+// Leaderboard score weights (tunable via env):
+//   score = W_STREAK*streak + W_AVGLEN*avgMinutes + W_PUNCTUALITY*earliness - W_PENALTY*penalties
+const LB_WEIGHTS = {
+  streak: parseFloat(process.env.W_STREAK) || 10,
+  avgLen: parseFloat(process.env.W_AVGLEN) || 2,
+  punctuality: parseFloat(process.env.W_PUNCTUALITY) || 5,
+  penalty: parseFloat(process.env.W_PENALTY) || 15
+};
+
 if (!TOKEN) {
   console.error('ERROR: TELEGRAM_BOT_TOKEN is not set in .env file!');
   process.exit(1);
@@ -81,18 +90,49 @@ function validateSubmission(msg) {
   }
 
   const minDuration = 300; // 5 minutes (300 seconds)
-  if (fileId && (duration >= minDuration || duration === 0)) {
-    return { valid: true, fileId, fileType, duration };
+
+  if (!fileId) {
+    return { valid: false, reason: 'no_media' };
   }
 
-  if (fileId && duration > 0 && duration < minDuration) {
+  // Unknown/zero length → we can't verify the 5-minute minimum. This happens when
+  // audio is sent as a "File"/document (Telegram reports no duration). Reject it
+  // so a 0s file can't sneak through.
+  if (!duration || duration <= 0) {
+    return { valid: false, reason: 'unknown_duration' };
+  }
+
+  if (duration < minDuration) {
     return {
       valid: false,
       reason: `Your recording is only ${Math.floor(duration / 60)}m ${duration % 60}s long. Minimum required is 5 minutes!`
     };
   }
 
-  return { valid: false, reason: 'no_media' };
+  return { valid: true, fileId, fileType, duration };
+}
+
+// Parse a YYMMDD day-tag (e.g. "260618" → 2026-06-18) out of a filename or
+// caption. Accepts optional - _ . / separators (260618, 26-06-18, 26_06_18).
+// Returns 'YYYY-MM-DD' or null if no valid date is present.
+function parseDateTag(text) {
+  if (!text) return null;
+  const re = /(\d{2})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g;
+  let m;
+  while ((m = re.exec(String(text))) !== null) {
+    const iso = `20${m[1]}-${m[2]}-${m[3]}`;
+    if (moment(iso, 'YYYY-MM-DD', true).isValid()) return iso;
+  }
+  return null;
+}
+
+// The day a recording counts for: read from the uploaded file's name first,
+// then the caption. Voice messages/videos have no filename, so those rely on
+// the caption.
+function getSubmissionDate(msg) {
+  const fileName = (msg.audio && msg.audio.file_name) ||
+                   (msg.document && msg.document.file_name) || null;
+  return parseDateTag(fileName) || parseDateTag(msg.caption) || null;
 }
 
 // Speaking topic suggestions (recommendation only — members are free to talk about anything)
@@ -237,8 +277,8 @@ async function startBot() {
   console.log(`📍 Timezone: ${TIMEZONE}`);
   console.log(`👤 Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None configured'}`);
 
-  // Set command suggestions (shows when typing /)
-  await bot.setMyCommands([
+  // Set command suggestions (shows when typing /).
+  const COMMAND_LIST = [
     { command: 'start', description: 'Welcome & instructions' },
     { command: 'submit', description: 'How to submit recordings' },
     { command: 'topic', description: "Today's speaking topic suggestion" },
@@ -250,8 +290,19 @@ async function startBot() {
     { command: 'penalties', description: 'Wall of shame (missed days)' },
     { command: 'myid', description: 'Get your Telegram user ID' },
     { command: 'help', description: 'Show all commands' }
-  ]);
-  console.log('✅ Command suggestions registered');
+  ];
+  // Telegram keeps a separate command list per scope. The default scope alone
+  // does NOT reliably show the slash-autocomplete in groups, so register the
+  // group scopes explicitly too.
+  try {
+    await bot.setMyCommands(COMMAND_LIST); // default scope (fallback / private)
+    await bot.setMyCommands(COMMAND_LIST, { scope: { type: 'all_private_chats' } });
+    await bot.setMyCommands(COMMAND_LIST, { scope: { type: 'all_group_chats' } });
+    await bot.setMyCommands(COMMAND_LIST, { scope: { type: 'all_chat_administrators' } });
+    console.log('✅ Command suggestions registered (default + private + groups)');
+  } catch (e) {
+    console.error('Failed to register command suggestions:', e.message);
+  }
 
   // A "scope" is the world a message belongs to:
   //   - group/supergroup -> the group's chat id (negative)
@@ -338,19 +389,20 @@ Let's practice English every day! 🚀
       await bot.sendMessage(chatId, `
 🎤 *How to Submit Your Daily Recording*
 
-Simply *send a voice message, video, or audio file* in this chat!
+Send an *audio file, voice message, or video* — but it *must carry a date* so I know which day it counts for.
+
+*Name the file (or add a caption) ending in the date as YYMMDD:*
+\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`
 
 *Requirements:*
 ⏱ Minimum *5 minutes* long
 🗣 Speak in English
-📅 One submission per day
+🏷 Must include the *YYMMDD* date tag
+📅 One recording per day
 
-*Tips:*
-• Talk about your day
-• Describe a picture
-• Summarize news/articles
-• Practice a presentation
-• Just speak freely!
+*Make-ups:* You can submit for *today or the last 2 days* — just use that day's date (e.g. send two files \`name_${moment().tz(TIMEZONE).subtract(1,'day').format('YYMMDD')}\` and \`name_${moment().tz(TIMEZONE).format('YYMMDD')}\` together).
+
+⚠️ *Fines:* Only *2 days in a row with no recording* triggers a fine — and only the *first* of those two days.
 
 Send your recording now! 🚀
 `, { parse_mode: 'Markdown' });
@@ -521,12 +573,40 @@ Keep up the great work! 💪
 
       const userStats = [];
       for (const user of users) {
-        const monthSubs = await db.getSubmissionsInRange(user.telegram_id, chatId, startOfMonth, endOfMonth);
+        const subs = await db.getSubmissionsDetailInRange(user.telegram_id, chatId, startOfMonth, endOfMonth);
         const streak = await db.calculateStreak(user.telegram_id, chatId);
-        userStats.push({ ...user, monthCount: monthSubs.length, streak });
+        const penalties = await db.getUserPenalties(user.telegram_id, chatId, 1000);
+        const monthPenalties = penalties.filter(p => {
+          const d = moment(p.penalty_date).format('YYYY-MM-DD');
+          return d >= startOfMonth && d <= endOfMonth;
+        }).length;
+
+        const monthCount = subs.length;
+        // Average recording length, in minutes.
+        const avgMinutes = monthCount > 0
+          ? (subs.reduce((s, x) => s + (x.duration || 0), 0) / monthCount) / 60
+          : 0;
+        // Punctuality: average earliness within the day (00:00 → 1.0, 23:59 → ~0.0).
+        let earliness = 0;
+        if (monthCount > 0) {
+          const sum = subs.reduce((acc, x) => {
+            if (!x.submitted_at) return acc;
+            const local = moment(x.submitted_at).tz(TIMEZONE);
+            const secs = local.hours() * 3600 + local.minutes() * 60 + local.seconds();
+            return acc + (1 - secs / 86400);
+          }, 0);
+          earliness = sum / monthCount;
+        }
+
+        const score = LB_WEIGHTS.streak * streak
+          + LB_WEIGHTS.avgLen * avgMinutes
+          + LB_WEIGHTS.punctuality * earliness
+          - LB_WEIGHTS.penalty * monthPenalties;
+
+        userStats.push({ ...user, monthCount, streak, avgMinutes, monthPenalties, score });
       }
 
-      userStats.sort((a, b) => b.monthCount - a.monthCount || b.streak - a.streak);
+      userStats.sort((a, b) => b.score - a.score);
 
       const todaySubmissions = await db.getTodaySubmissions(chatId, today);
 
@@ -537,9 +617,10 @@ Keep up the great work! 💪
       userStats.forEach((user, index) => {
         const rank = index < 3 ? medals[index] : `${index + 1}.`;
         const name = user.first_name || user.username || `User ${user.telegram_id}`;
-        let line = `${rank} *${name}* - ${user.monthCount} this month`;
-        if (user.streak > 0) line += ` 🔥${user.streak}d`;
+        let line = `${rank} *${name}* — *${user.score.toFixed(1)}* pts`;
         if (index === 0 && user.monthCount > 0) line += ' 👑';
+        line += `\n   📅 ${user.monthCount} • 🔥 ${user.streak}d • ⏱ ${user.avgMinutes.toFixed(1)}m`;
+        if (user.monthPenalties > 0) line += ` • ⚠️ ${user.monthPenalties}`;
         leaderboardMsg += `${line}\n`;
       });
 
@@ -622,6 +703,9 @@ ${isAdmin(userId) ? `
 /status - Today's submission status
 /report - Full daily report
 /check - Check who hasn't submitted
+/addmember - Add a member (reply or user id)
+/removemember - Remove a member
+/penalty - Add a penalty
 /deadline - Set deadline time
 /broadcast - Send message to all users
 /testai - Check if AI topic generation works
@@ -658,6 +742,8 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 /status - Today's submission status
 /report - Full daily report with stats
 /check - Users who haven't submitted
+/addmember - Add a member (reply to them, or /addmember <user_id>)
+/removemember - Remove a member (reply, or /removemember <user_id>)
 /penalty [user_id] - Add penalty to user
 /broadcast [message] - Broadcast to all users
 /setdeadline HH:MM - Set deadline time
@@ -874,6 +960,95 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   });
 
+  // Add a member to this group's tracker (admin). The bot only auto-knows people
+  // who have posted, so this covers lurkers. Two ways:
+  //   • reply to the person's message with /addmember   (best — captures their name)
+  //   • /addmember <user_id>
+  bot.onText(/^\/addmember(?:@\w+)?(?:\s+(\d+))?/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+      if (!isGroupChat(msg)) {
+        await bot.sendMessage(chatId, 'ℹ️ Use this *inside the group* you want to add the member to.', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // Resolve the target: a replied-to user is best (gives their real name).
+      let target = null;
+      if (msg.reply_to_message && msg.reply_to_message.from) {
+        const f = msg.reply_to_message.from;
+        target = { id: f.id, username: f.username || null, first_name: f.first_name || null, last_name: f.last_name || null };
+      } else if (match[1]) {
+        const id = parseInt(match[1]);
+        const existing = await db.getUser(id);
+        target = existing
+          ? { id, username: existing.username, first_name: existing.first_name, last_name: existing.last_name }
+          : { id, username: null, first_name: `Member ${id}`, last_name: null };
+      }
+
+      if (!target) {
+        await bot.sendMessage(chatId,
+          `➕ *Add a member*\n\n` +
+          `• *Reply* to the person's message with \`/addmember\` (recommended — gets their name), or\n` +
+          `• \`/addmember <user_id>\`\n\n` +
+          `_Telegram doesn't let bots list group members, so add anyone who hasn't posted yet this way._`,
+          { parse_mode: 'Markdown' });
+        return;
+      }
+
+      if (target.id === (await bot.getMe()).id) {
+        await bot.sendMessage(chatId, "🤖 That's me — I don't need to be tracked.");
+        return;
+      }
+
+      await db.registerGroup(chatId, msg.chat.title || null);
+      await db.registerUser(target.id, target.username, target.first_name, target.last_name);
+      await db.registerGroupMember(chatId, target.id);
+
+      const name = formatUserDisplay(await db.getUser(target.id));
+      await bot.sendMessage(chatId, `✅ Added *${name}* to this group's tracker. They'll now appear in /status, /leaderboard and reminders.`, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error in /addmember:', err.message);
+    }
+  });
+
+  // Remove a member from this group's tracker (admin). Reply or /removemember <id>.
+  bot.onText(/^\/removemember(?:@\w+)?(?:\s+(\d+))?/, async (msg, match) => {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+
+      if (!isAdmin(userId)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+      if (!isGroupChat(msg)) {
+        await bot.sendMessage(chatId, 'ℹ️ Use this inside the group.');
+        return;
+      }
+
+      let targetId = null;
+      if (msg.reply_to_message && msg.reply_to_message.from) targetId = msg.reply_to_message.from.id;
+      else if (match[1]) targetId = parseInt(match[1]);
+
+      if (!targetId) {
+        await bot.sendMessage(chatId, 'Usage: reply to the person with `/removemember`, or `/removemember <user_id>`.', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      await db.removeGroupMember(chatId, targetId);
+      const user = await db.getUser(targetId);
+      await bot.sendMessage(chatId, `✅ Removed ${user ? formatUserDisplay(user) : `user ${targetId}`} from this group's tracker. (Their past records are kept.)`);
+    } catch (err) {
+      console.error('Error in /removemember:', err.message);
+    }
+  });
+
   // Add penalty (admin)
   bot.onText(/\/penalty(?:\s+(\d+))?/, async (msg, match) => {
     try {
@@ -1016,11 +1191,47 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         if (validation.reason === 'no_media') {
           return;
         }
+        if (validation.reason === 'unknown_duration') {
+          await bot.sendMessage(chatId,
+            `❌ I couldn't read this file's length, so I can't confirm it's at least 5 minutes.\n\n` +
+            `Please send it as a *voice message* or an *audio file* — *not* as a “File”/document — so I can check the duration.\n` +
+            `(Audio files still keep their name, so the \`name_YYMMDD\` tag works.)`,
+            { parse_mode: 'Markdown', ...replyOpts });
+          return;
+        }
         await bot.sendMessage(chatId, `❌ ${validation.reason}\n\nPlease send a recording of at least 5 minutes.`, replyOpts);
         return;
       }
 
+      // Work out which day this recording is for, from its name/caption tag.
       const today = getToday();
+      const minDate = moment().tz(TIMEZONE).subtract(2, 'days').format('YYYY-MM-DD');
+      const submissionDate = getSubmissionDate(msg);
+
+      if (!submissionDate) {
+        await bot.sendMessage(chatId,
+          `❌ I couldn't find a date on this recording.\n\n` +
+          `Please name the file (or add a caption) ending in the date as *YYMMDD*:\n` +
+          `\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`\n\n` +
+          `That tells me which day it counts for.`,
+          { parse_mode: 'Markdown', ...replyOpts });
+        return;
+      }
+
+      if (submissionDate > today) {
+        await bot.sendMessage(chatId,
+          `❌ That date (\`${submissionDate}\`) is in the future. You can only submit for today or the last 2 days.`,
+          { parse_mode: 'Markdown', ...replyOpts });
+        return;
+      }
+
+      if (submissionDate < minDate) {
+        await bot.sendMessage(chatId,
+          `❌ Too late for \`${submissionDate}\`. Make-ups are only accepted up to 2 days late (since \`${minDate}\`).`,
+          { parse_mode: 'Markdown', ...replyOpts });
+        return;
+      }
+
       const result = await db.recordSubmission(
         userId,
         chatId,
@@ -1028,7 +1239,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         validation.fileType,
         validation.duration,
         msg.caption || null,
-        today
+        submissionDate
       );
 
       if (result.success) {
@@ -1046,6 +1257,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
         const typeEmoji = validation.fileType === 'voice' ? '🎤' :
                           validation.fileType === 'video' ? '📹' : '🎵';
+        const makeupTag = submissionDate !== today ? ' _(make-up)_' : '';
 
         const user = await db.getUser(userId);
         const userName = formatUserDisplay(user);
@@ -1053,7 +1265,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         await bot.sendMessage(chatId,
           `✅ *Submission Recorded!* ${typeEmoji}\n` +
           (isGroup ? `👤 ${userName}\n` : '') +
-          `📅 ${today}\n` +
+          `📅 ${submissionDate}${makeupTag}\n` +
           `⏱ ${durationStr}${streakMsg}\n\n` +
           `Keep up the great work! 🚀\n` +
           `Check your stats with /mystats`,
@@ -1064,7 +1276,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         for (const adminId of ADMIN_IDS) {
           try {
             await bot.sendMessage(adminId,
-              `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${today}\n⏱ ${durationStr}${streakMsg}`,
+              `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${submissionDate}${makeupTag}\n⏱ ${durationStr}${streakMsg}`,
               { parse_mode: 'Markdown' }
             );
           } catch (e) {}
@@ -1132,15 +1344,29 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Deadline alert at 23:59 — per group, plus DMs for 1:1 users
+  // Deadline alert at 23:59 — per group, plus DMs for 1:1 users.
+  // Also finalises fines. A recording can be backdated up to 2 days, so a day's
+  // fine isn't locked until that 2-day make-up window closes. Tonight (end of
+  // day X) we finalise the day-before-yesterday (D = X-2): it's fined only if
+  // both D and D+1 still have no recording. The most recent uncovered day keeps
+  // its grace.
   cron.schedule('59 23 * * *', async () => {
     try {
       const today = getToday();
+      const yesterday = moment().tz(TIMEZONE).subtract(1, 'day').format('YYYY-MM-DD');
+      const dayBeforeYesterday = moment().tz(TIMEZONE).subtract(2, 'days').format('YYYY-MM-DD');
       const groups = await db.getAllGroups();
 
       for (const g of groups) {
         const usersStatus = await db.getAllUsersWithTodayStatus(g.chat_id, today);
         const notSubmitted = usersStatus.filter(u => !u.submission_id);
+
+        // Finalise fines for the day-before-yesterday for everyone in this group.
+        const fined = [];
+        for (const u of usersStatus) {
+          const wasFined = await db.assessMissedDay(u.telegram_id, g.chat_id, dayBeforeYesterday, yesterday);
+          if (wasFined) fined.push(formatUserDisplay(u));
+        }
 
         if (notSubmitted.length === 0) {
           try {
@@ -1149,23 +1375,22 @@ Just send a voice message, video, or audio file of at least 5 minutes!
               { parse_mode: 'Markdown' }
             );
           } catch (e) {}
-          continue;
+        } else {
+          const names = notSubmitted.map(u => formatUserDisplay(u)).join(', ');
+          try {
+            await bot.sendMessage(g.chat_id,
+              `⛔ *Deadline reached - ${today}*\n\nNo recording yet for today (${notSubmitted.length}): ${names}\n\n` +
+              `_You can still send a make-up for the last 2 days (name it \`name_YYMMDD\`). Two days in a row with nothing = a fine._`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (e) {}
         }
 
-        const names = notSubmitted.map(u => formatUserDisplay(u)).join(', ');
-        try {
-          await bot.sendMessage(g.chat_id,
-            `⛔ *Deadline reached - ${today}*\n\nMissed today (${notSubmitted.length}): ${names}\n\nStart fresh tomorrow! 💪`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (e) {}
-
-        // Admins get penalty hints. NOTE: run /penalty inside this group so it
-        // applies to the right scope.
-        let reportMsg = `⛔ *${g.title || 'Group'} - ${today}* (run /penalty in the group)\nMissing: *${notSubmitted.length}*\n\n`;
-        notSubmitted.forEach((u, i) => {
-          reportMsg += `${i + 1}. ${formatUserDisplay(u)} → /penalty ${u.telegram_id}\n`;
-        });
+        // Admin summary including any fines auto-applied.
+        let reportMsg = `📋 *${g.title || 'Group'} - ${today}*\n`;
+        reportMsg += `No recording today: *${notSubmitted.length}*\n`;
+        reportMsg += `Fines applied for ${dayBeforeYesterday}: *${fined.length}*`;
+        if (fined.length > 0) reportMsg += `\n💀 ${fined.join(', ')}`;
         for (const adminId of ADMIN_IDS) {
           try {
             await bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
@@ -1173,15 +1398,19 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         }
       }
 
-      // Personal 1:1 deadline notices
+      // Personal 1:1 scope: finalise fines and send deadline notices.
       const privateUsers = await db.getPrivateParticipants();
       for (const u of privateUsers) {
+        await db.assessMissedDay(u.telegram_id, u.telegram_id, dayBeforeYesterday, yesterday);
+
         const submittedToday = await db.getSubmissionCountForDate(u.telegram_id, u.telegram_id, today);
         if (submittedToday > 0) continue;
         const name = u.first_name || 'there';
         try {
           await bot.sendMessage(u.telegram_id,
-            `⛔ *Deadline Missed!*\n\nHey ${name}, you didn't submit your English recording today.\n\nDon't worry - start fresh tomorrow! 💪`,
+            `⛔ *No recording for today yet!*\n\nHey ${name}, you haven't submitted for today.\n\n` +
+            `You can still send a make-up for the last 2 days (name it \`name_YYMMDD\`). ` +
+            `Two days in a row with nothing becomes a fine. 💪`,
             { parse_mode: 'Markdown' }
           );
         } catch (e) {}
