@@ -121,6 +121,20 @@ class DatabaseManager {
     return this.queryAll('SELECT * FROM groups WHERE is_active = 1');
   }
 
+  // Quiet mode: when on, the bot doesn't confirm submissions or post the daily
+  // topic in this chat (it still warns about invalid recordings).
+  async isQuiet(chatId) {
+    const row = await this.queryOne('SELECT quiet FROM chat_settings WHERE chat_id = $1', [chatId]);
+    return !!(row && row.quiet === 1);
+  }
+
+  async setQuiet(chatId, on) {
+    await this.run(`
+      INSERT INTO chat_settings (chat_id, quiet) VALUES ($1, $2)
+      ON CONFLICT (chat_id) DO UPDATE SET quiet = EXCLUDED.quiet
+    `, [chatId, on ? 1 : 0]);
+  }
+
   async registerGroupMember(chatId, telegramId) {
     await this.run(`
       INSERT INTO group_members (chat_id, telegram_id, is_active) VALUES ($1, $2, 1)

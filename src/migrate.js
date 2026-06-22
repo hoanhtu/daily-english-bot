@@ -106,6 +106,16 @@ async function migrate() {
     `);
     console.log('✅ groups table created');
 
+    // Per-chat settings (e.g. quiet mode). Keyed by chat_id (group id or, for a
+    // 1:1 chat, the user's id).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_settings (
+        chat_id BIGINT PRIMARY KEY,
+        quiet INTEGER DEFAULT 0
+      );
+    `);
+    console.log('✅ chat_settings table created');
+
     // Which users participate in which group
     await pool.query(`
       CREATE TABLE IF NOT EXISTS group_members (
