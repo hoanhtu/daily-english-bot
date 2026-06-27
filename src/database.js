@@ -175,39 +175,72 @@ class DatabaseManager {
     `);
   }
 
-  async recordSubmission(userId, chatId, fileId, fileType, duration, caption, date) {
-    const timezone = process.env.TIMEZONE || 'Asia/Saigon';
-    const today = moment().tz(timezone).format('YYYY-MM-DD');
-
-    const existing = await this.queryOne(
-      'SELECT id FROM submissions WHERE user_id = $1 AND chat_id = $2 AND submission_date = $3 AND is_valid = 1',
-      [userId, chatId, date]
-    );
-
-    if (existing) {
-      return { success: false, message: `You already have a recording for ${date}!` };
+  // The first day a member is "required" to submit in a scope (no penalties for
+  // days before this). Group → when they joined the group; private → when they
+  // registered. Returns 'YYYY-MM-DD'.
+  async getMemberStartDate(chatId, telegramId) {
+    const tz = process.env.TIMEZONE || 'Asia/Saigon';
+    if (chatId < 0) {
+      const row = await this.queryOne(
+        'SELECT joined_at FROM group_members WHERE chat_id = $1 AND telegram_id = $2',
+        [chatId, telegramId]
+      );
+      if (row && row.joined_at) return moment(row.joined_at).tz(tz).format('YYYY-MM-DD');
+    } else {
+      const u = await this.queryOne('SELECT registered_at FROM users WHERE telegram_id = $1', [telegramId]);
+      if (u && u.registered_at) return moment(u.registered_at).tz(tz).format('YYYY-MM-DD');
     }
-
-    await this.run(
-      'INSERT INTO submissions (user_id, chat_id, submission_date, file_id, file_type, duration, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [userId, chatId, date, fileId, fileType, duration || 0, caption || null]
-    );
-
-    // Fines are NOT decided here. A missed day is only fined when the NEXT day is
-    // also missed (the most recent miss always gets a one-day grace), so all
-    // penalty assessment happens in the nightly deadline job. Submitting can only
-    // ever avoid a fine, never cause one.
-    return { success: true, message: 'Submission recorded successfully!' };
+    return moment().tz(tz).format('YYYY-MM-DD');
   }
 
-  // True if the user has any valid submission in this scope strictly before `date`.
-  // Used to avoid fining brand-new participants for days before they joined.
-  async hasSubmissionBefore(userId, chatId, date) {
-    const row = await this.queryOne(
-      'SELECT 1 FROM submissions WHERE user_id = $1 AND chat_id = $2 AND submission_date < $3 AND is_valid = 1 LIMIT 1',
-      [userId, chatId, date]
+  // Record an incoming valid file. Files are DATELESS — we assign each one to the
+  // member's OLDEST still-uncovered required day, up to today. If they are fully
+  // caught up (no uncovered day ≤ today), the file is discarded (no paying ahead).
+  // `sentDate` is the day the file was uploaded; `startDate` is the member's first
+  // required day. Returns { success, assignedDate, onTime } or { discarded }.
+  async recordSubmission(userId, chatId, fileId, fileType, duration, caption, sentDate, startDate) {
+    const covRows = await this.queryAll(
+      'SELECT submission_date::text d FROM submissions WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1',
+      [userId, chatId]
     );
-    return !!row;
+    const penRows = await this.queryAll(
+      'SELECT penalty_date::text d FROM penalties WHERE user_id = $1 AND chat_id = $2',
+      [userId, chatId]
+    );
+    const covered = new Set(covRows.map(r => String(r.d)));
+    const penalized = new Set(penRows.map(r => String(r.d)));
+
+    // Walk from the member's start day forward to today; the first day that is
+    // neither covered nor already penalised (closed out) is the fill target.
+    // Cap the look-back so we never iterate an unbounded range.
+    const lower = moment.max(
+      moment(startDate, 'YYYY-MM-DD'),
+      moment(sentDate, 'YYYY-MM-DD').subtract(90, 'days')
+    ).format('YYYY-MM-DD');
+
+    let target = null;
+    let cursor = lower;
+    while (cursor <= sentDate) {
+      if (!covered.has(cursor) && !penalized.has(cursor)) { target = cursor; break; }
+      cursor = moment(cursor, 'YYYY-MM-DD').add(1, 'day').format('YYYY-MM-DD');
+    }
+
+    if (!target) {
+      return { success: false, discarded: true };
+    }
+
+    try {
+      await this.run(
+        'INSERT INTO submissions (user_id, chat_id, submission_date, file_id, file_type, duration, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [userId, chatId, target, fileId, fileType, duration || 0, caption || null]
+      );
+    } catch (e) {
+      // Unique (user, chat, day) conflict from a race with a sibling file — treat
+      // as discarded; the user can resend if a day really is still open.
+      return { success: false, discarded: true };
+    }
+
+    return { success: true, assignedDate: target, onTime: target === sentDate };
   }
 
   async penaltyExists(userId, chatId, penaltyDate) {
@@ -216,21 +249,6 @@ class DatabaseManager {
       [userId, chatId, penaltyDate]
     );
     return !!row;
-  }
-
-  // Apply the fine rule for a single missed day `missedDate` in a scope:
-  // fine it only if the user also missed the following day (`nextDate`), is an
-  // established participant, and hasn't already been fined for that day.
-  // Returns true if a new penalty was recorded.
-  async assessMissedDay(userId, chatId, missedDate, nextDate) {
-    const submittedMissed = await this.getSubmissionCountForDate(userId, chatId, missedDate);
-    if (submittedMissed > 0) return false;               // they did submit that day
-    const submittedNext = await this.getSubmissionCountForDate(userId, chatId, nextDate);
-    if (submittedNext > 0) return false;                 // next-day submission grants grace
-    if (!(await this.hasSubmissionBefore(userId, chatId, missedDate))) return false; // not yet active
-    if (await this.penaltyExists(userId, chatId, missedDate)) return false;          // already fined
-    await this.addPenalty(userId, chatId, missedDate, 'Missed daily submission (2-day rule)');
-    return true;
   }
 
   async getTodaySubmissions(chatId, date) {
@@ -331,14 +349,16 @@ class DatabaseManager {
       SELECT submission_date::text as submission_date, submitted_at FROM submissions
       WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1
     `, [userId, chatId]);
-
-    if (submissions.length === 0) return 0;
+    const penRows = await this.queryAll(
+      'SELECT penalty_date::text d FROM penalties WHERE user_id = $1 AND chat_id = $2',
+      [userId, chatId]
+    );
 
     const tz = process.env.TIMEZONE || 'Asia/Saigon';
 
-    // Only days submitted ON that very day count toward the streak. A make-up
-    // (sent on a later day, e.g. tagged 260617 but uploaded on the 18th) avoids
-    // a fine but does NOT build streak — streak rewards daily submission.
+    // Only days submitted ON that very day count toward the streak. A late make-up
+    // (assigned to an earlier day than the day it was uploaded) avoids a fine but
+    // does NOT build streak — streak rewards daily submission.
     const onTime = new Set();
     for (const s of submissions) {
       if (!s.submitted_at) continue;
@@ -346,22 +366,30 @@ class DatabaseManager {
       const sentDay = moment(s.submitted_at).tz(tz).format('YYYY-MM-DD');
       if (sentDay === forDay) onTime.add(forDay);
     }
+    const penalized = new Set(penRows.map(r => String(r.d)));
     if (onTime.size === 0) return 0;
 
+    const isSat = d => moment(d, 'YYYY-MM-DD').day() === 6;
+    const prev = d => moment(d, 'YYYY-MM-DD').subtract(1, 'day').format('YYYY-MM-DD');
     const today = moment().tz(tz).format('YYYY-MM-DD');
-    const yesterday = moment().tz(tz).subtract(1, 'day').format('YYYY-MM-DD');
 
-    // Anchor at today if done on time, otherwise yesterday (the grace day), so a
-    // running streak isn't shown as 0 just because today isn't done yet.
-    let expectedDate;
-    if (onTime.has(today)) expectedDate = today;
-    else if (onTime.has(yesterday)) expectedDate = yesterday;
-    else return 0; // last on-time submission is older than yesterday → streak broken
+    // Saturday is a rest day: it's neither a counting day nor breaks the streak
+    // (the chain carries across it) — UNLESS Saturday was penalised, which breaks.
+    // Every other day is a counting day and must be submitted on time.
+    let cursor = today;
+    // Grace: a counting `today` not yet submitted on time is still pending, so
+    // begin evaluating from the previous day instead of breaking immediately.
+    if (!isSat(cursor) && !onTime.has(cursor)) cursor = prev(cursor);
 
     let streak = 0;
-    while (onTime.has(expectedDate)) {
-      streak++;
-      expectedDate = moment(expectedDate).subtract(1, 'day').format('YYYY-MM-DD');
+    for (let guard = 0; guard < 1000; guard++) {
+      if (isSat(cursor)) {
+        if (penalized.has(cursor)) break; // a penalised Saturday breaks the chain
+        cursor = prev(cursor);             // otherwise carry across Saturday
+        continue;
+      }
+      if (onTime.has(cursor)) { streak++; cursor = prev(cursor); continue; }
+      break; // first counting day not done on time ends the streak
     }
     return streak;
   }

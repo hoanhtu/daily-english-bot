@@ -112,36 +112,6 @@ function validateSubmission(msg) {
   return { valid: true, fileId, fileType, duration };
 }
 
-// Parse a day-tag out of a filename or caption. Accepts YYYYMMDD or YYMMDD with
-// optional - _ . / separators (20260618, 2026-06-18, 260618, 26-06-18).
-// Returns 'YYYY-MM-DD' or null if no valid date is present.
-function parseDateTag(text) {
-  if (!text) return null;
-  const s = String(text);
-  // Try full-year (YYYYMMDD) first so an 8-digit tag isn't mis-read as YY-MM-DD,
-  // then 2-digit-year (YYMMDD). Optional - _ . / separators in both.
-  const patterns = [
-    { re: /(\d{4})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g, year: m => m[1] },
-    { re: /(\d{2})[-_.\/]?(\d{2})[-_.\/]?(\d{2})/g, year: m => `20${m[1]}` }
-  ];
-  for (const p of patterns) {
-    let m;
-    while ((m = p.re.exec(s)) !== null) {
-      const iso = `${p.year(m)}-${m[2]}-${m[3]}`;
-      if (moment(iso, 'YYYY-MM-DD', true).isValid()) return iso;
-    }
-  }
-  return null;
-}
-
-// The day a recording counts for: read from the uploaded file's name first,
-// then the caption. Voice messages/videos have no filename, so those rely on
-// the caption.
-function getSubmissionDate(msg) {
-  const fileName = (msg.audio && msg.audio.file_name) ||
-                   (msg.document && msg.document.file_name) || null;
-  return parseDateTag(fileName) || parseDateTag(msg.caption) || null;
-}
 
 // Speaking topic suggestions (recommendation only — members are free to talk about anything)
 const SPEAKING_TOPICS = [
@@ -397,20 +367,17 @@ Let's practice English every day! 🚀
       await bot.sendMessage(chatId, `
 🎤 *How to Submit Your Daily Recording*
 
-Send an *audio file, voice message, or video* — but it *must carry a date* so I know which day it counts for.
-
-*Name the file (or add a caption) ending in the date — YYMMDD or YYYYMMDD both work:*
-\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`  or  \`yourname_${moment().tz(TIMEZONE).format('YYYYMMDD')}\`
+Just *send a voice message, video, or audio file*. No filenames or dates needed — I count each valid recording automatically.
 
 *Requirements:*
-⏱ Minimum *5 minutes* long
+⏱ Minimum *5 minutes* long (one file = one day)
 🗣 Speak in English
-🏷 Must include the date tag (*YYMMDD* or *YYYYMMDD*)
 📅 One recording per day
 
-*Make-ups:* You can submit for *today or the last 2 days* — just use that day's date (e.g. send two files \`name_${moment().tz(TIMEZONE).subtract(1,'day').format('YYMMDD')}\` and \`name_${moment().tz(TIMEZONE).format('YYMMDD')}\` together).
+*Catching up:* Each recording fills your *oldest unfinished day first*. So if you missed yesterday, send *two* recordings today — the first covers yesterday, the second covers today. You can't bank ahead: extra files when you're all caught up are ignored.
 
-⚠️ *Fines:* Only *2 days in a row with no recording* triggers a fine — and only the *first* of those two days.
+⚠️ *Fines:* You may be *1 day late*. If a day is still missing by the end of the next day, you get *1 penalty* for it — so never go *2 days in a row* with nothing.
+🗓 *Saturday* is relaxed: its recording can be turned in as late as *Monday*.
 
 Send your recording now! 🚀
 `, { parse_mode: 'Markdown' });
@@ -715,6 +682,7 @@ ${isAdmin(userId) ? `
 /removemember - Remove a member
 /quiet - Toggle quiet mode (no submit replies / daily topic)
 /penalty - Add a penalty
+/forcecheck - Run the end-of-day penalty job now
 /deadline - Set deadline time
 /broadcast - Send message to all users
 /testai - Check if AI topic generation works
@@ -755,6 +723,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 /removemember - Remove a member (reply, or /removemember <user_id>)
 /quiet [on|off] - Mute submit replies & daily topic in this chat
 /penalty [user_id] - Add penalty to user
+/forcecheck - Run the end-of-day penalty job now
 /broadcast [message] - Broadcast to all users
 /setdeadline HH:MM - Set deadline time
 /testai - Check if AI topic generation works
@@ -1084,11 +1053,27 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
       await bot.sendMessage(chatId,
         quiet
-          ? `🔇 *Quiet mode ON.*\nI'll go silent here — no submission confirmations, no daily topic, no reminders, and no deadline summary.\n\nI'll *still* warn when a recording is too short, missing a date, or unreadable, and fines are *still* applied automatically.\n\n_Turn back on with_ \`/quiet off\``
-          : `🔔 *Quiet mode OFF.*\nI'll confirm submissions and post the daily topic, reminders, and deadline summary again.`,
+          ? `🔇 *Quiet mode ON.*\nI'll go silent here — no submission confirmations, no daily topic, no reminders, and no penalty announcements.\n\nI'll *still* warn when a recording is too short or unreadable, and fines are *still* applied automatically.\n\n_Turn back on with_ \`/quiet off\``
+          : `🔔 *Quiet mode OFF.*\nI'll confirm submissions and post the daily topic, reminders, and penalty announcements again.`,
         { parse_mode: 'Markdown' });
     } catch (err) {
       console.error('Error in /quiet:', err.message);
+    }
+  });
+
+  // Force-run the nightly penalty job now (admin) — for testing/ops.
+  bot.onText(/^\/forcecheck/, async (msg) => {
+    try {
+      const chatId = msg.chat.id;
+      if (!isAdmin(msg.from.id)) {
+        await bot.sendMessage(chatId, '⛔ Not authorized.');
+        return;
+      }
+      await bot.sendMessage(chatId, '⏳ Running the end-of-day penalty check…');
+      await runDeadlineCheck();
+      await bot.sendMessage(chatId, '✅ Penalty check complete.');
+    } catch (err) {
+      console.error('Error in /forcecheck:', err.message);
     }
   });
 
@@ -1237,8 +1222,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         if (validation.reason === 'unknown_duration') {
           await bot.sendMessage(chatId,
             `❌ I couldn't read this file's length, so I can't confirm it's at least 5 minutes.\n\n` +
-            `Please send it as a *voice message* or an *audio file* — *not* as a “File”/document — so I can check the duration.\n` +
-            `(Audio files still keep their name, so the \`name_YYMMDD\` tag works.)`,
+            `Please send it as a *voice message* or an *audio file* — *not* as a “File”/document — so I can check the duration.`,
             { parse_mode: 'Markdown', ...replyOpts });
           return;
         }
@@ -1246,35 +1230,10 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         return;
       }
 
-      // Work out which day this recording is for, from its name/caption tag.
+      // Files are dateless: the recording fills the member's OLDEST still-uncovered
+      // day (up to today). Extra files when fully caught up are discarded.
       const today = getToday();
-      const minDate = moment().tz(TIMEZONE).subtract(2, 'days').format('YYYY-MM-DD');
-      const submissionDate = getSubmissionDate(msg);
-
-      if (!submissionDate) {
-        await bot.sendMessage(chatId,
-          `❌ I couldn't find a date on this recording.\n\n` +
-          `Please name the file (or add a caption) ending in the date — *YYMMDD* or *YYYYMMDD*:\n` +
-          `\`yourname_${moment().tz(TIMEZONE).format('YYMMDD')}\`  or  \`yourname_${moment().tz(TIMEZONE).format('YYYYMMDD')}\`\n\n` +
-          `That tells me which day it counts for.`,
-          { parse_mode: 'Markdown', ...replyOpts });
-        return;
-      }
-
-      if (submissionDate > today) {
-        await bot.sendMessage(chatId,
-          `❌ That date (\`${submissionDate}\`) is in the future. You can only submit for today or the last 2 days.`,
-          { parse_mode: 'Markdown', ...replyOpts });
-        return;
-      }
-
-      if (submissionDate < minDate) {
-        await bot.sendMessage(chatId,
-          `❌ Too late for \`${submissionDate}\`. Make-ups are only accepted up to 2 days late (since \`${minDate}\`).`,
-          { parse_mode: 'Markdown', ...replyOpts });
-        return;
-      }
-
+      const startDate = await db.getMemberStartDate(chatId, userId);
       const result = await db.recordSubmission(
         userId,
         chatId,
@@ -1282,10 +1241,14 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         validation.fileType,
         validation.duration,
         msg.caption || null,
-        submissionDate
+        today,
+        startDate
       );
 
+      const quiet = await db.isQuiet(chatId);
+
       if (result.success) {
+        const assignedDate = result.assignedDate;
         const durationStr = validation.duration > 0
           ? `(${Math.floor(validation.duration / 60)}m ${validation.duration % 60}s)`
           : '';
@@ -1300,19 +1263,18 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
         const typeEmoji = validation.fileType === 'voice' ? '🎤' :
                           validation.fileType === 'video' ? '📹' : '🎵';
-        const makeupTag = submissionDate !== today ? ' _(make-up)_' : '';
+        const makeupTag = result.onTime ? '' : ' _(catch-up — does not count for streak)_';
 
         const user = await db.getUser(userId);
         const userName = formatUserDisplay(user);
 
         // Quiet mode: record silently (no in-chat confirmation). Admins are still
         // notified, and invalid/too-short recordings are still warned about above.
-        const quiet = await db.isQuiet(chatId);
         if (!quiet) {
           await bot.sendMessage(chatId,
             `✅ *Submission Recorded!* ${typeEmoji}\n` +
             (isGroup ? `👤 ${userName}\n` : '') +
-            `📅 ${submissionDate}${makeupTag}\n` +
+            `📅 Counts for: ${assignedDate}${makeupTag}\n` +
             `⏱ ${durationStr}${streakMsg}\n\n` +
             `Keep up the great work! 🚀\n` +
             `Check your stats with /mystats`,
@@ -1324,16 +1286,18 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         for (const adminId of ADMIN_IDS) {
           try {
             await bot.sendMessage(adminId,
-              `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${submissionDate}${makeupTag}\n⏱ ${durationStr}${streakMsg}`,
+              `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${assignedDate}${makeupTag}\n⏱ ${durationStr}${streakMsg}`,
               { parse_mode: 'Markdown' }
             );
           } catch (e) {}
         }
-      } else {
-        // "Already submitted for that day" — suppress in quiet mode (it's not an
-        // invalid recording, just a duplicate notice).
-        if (!(await db.isQuiet(chatId))) {
-          await bot.sendMessage(chatId, `⚠️ ${result.message}\n\nYou can view your stats with /mystats`, replyOpts);
+      } else if (result.discarded) {
+        // Fully caught up — the file isn't needed (no paying ahead). Let them know
+        // (unless quiet) so they don't think it was lost.
+        if (!quiet) {
+          await bot.sendMessage(chatId,
+            `👍 You're all caught up — no day is owed, so this extra recording isn't needed (you can't bank ahead for future days).`,
+            replyOpts);
         }
       }
     } catch (err) {
@@ -1398,81 +1362,82 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Deadline alert at 23:59 — per group, plus DMs for 1:1 users.
-  // Also finalises fines. A recording can be backdated up to 2 days, so a day's
-  // fine isn't locked until that 2-day make-up window closes. Tonight (end of
-  // day X) we finalise the day-before-yesterday (D = X-2): it's fined only if
-  // both D and D+1 still have no recording. The most recent uncovered day keeps
-  // its grace.
-  cron.schedule('59 23 * * *', async () => {
-    try {
-      const today = getToday();
-      const yesterday = moment().tz(TIMEZONE).subtract(1, 'day').format('YYYY-MM-DD');
-      const dayBeforeYesterday = moment().tz(TIMEZONE).subtract(2, 'days').format('YYYY-MM-DD');
-      const groups = await db.getAllGroups();
+  // Which recording-day(s) hit their deadline at the END of day X.
+  //   • Normal day R → deadline end of R+1, so X-1 is due tonight (unless it's a Saturday).
+  //   • Saturday is special: its recording is deferred to Monday (R+2), so a
+  //     Saturday two days ago (X-2) is due tonight — which only happens on Monday.
+  // (Sun→Mon, all other days → +1.) This yields: nothing due on Sunday night,
+  // and both Sat+Sun due on Monday night.
+  function dueRecordingDays(today) {
+    const dow = d => moment(d, 'YYYY-MM-DD').day(); // 0=Sun … 6=Sat
+    const minus = n => moment(today, 'YYYY-MM-DD').subtract(n, 'days').format('YYYY-MM-DD');
+    const due = [];
+    const yesterday = minus(1);
+    if (dow(yesterday) !== 6) due.push(yesterday); // a Saturday is NOT due the next day
+    const twoAgo = minus(2);
+    if (dow(twoAgo) === 6) due.push(twoAgo);       // deferred Saturday comes due (Monday night)
+    return due;
+  }
 
-      for (const g of groups) {
-        const usersStatus = await db.getAllUsersWithTodayStatus(g.chat_id, today);
-        const notSubmitted = usersStatus.filter(u => !u.submission_id);
+  // Assess penalties for whichever recording-days are now past their deadline, per
+  // scope. Fines are applied even in quiet mode (quiet only silences the public
+  // announcement). `catchUp` just changes the announcement wording.
+  async function runDeadlineCheck(catchUp = false) {
+    const today = getToday();
+    const due = dueRecordingDays(today);
+    if (due.length === 0) return; // e.g. Sunday night — nothing newly due
+    const prefix = catchUp ? '[catch-up] ' : '';
 
-        // Finalise fines for the day-before-yesterday for everyone in this group.
-        // Fines are assessed even in quiet mode — quiet only silences messages.
-        const fined = [];
-        for (const u of usersStatus) {
-          const wasFined = await db.assessMissedDay(u.telegram_id, g.chat_id, dayBeforeYesterday, yesterday);
-          if (wasFined) fined.push(formatUserDisplay(u));
-        }
-
-        if (await db.isQuiet(g.chat_id)) continue; // quiet: skip the deadline summary (fines already done)
-
-        if (notSubmitted.length === 0) {
-          try {
-            await bot.sendMessage(g.chat_id,
-              `🎉 *All clear!* Everyone in this group submitted today! 📅 ${today}`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (e) {}
-        } else {
-          const names = notSubmitted.map(u => formatUserDisplay(u)).join(', ');
-          try {
-            await bot.sendMessage(g.chat_id,
-              `⛔ *Deadline reached - ${today}*\n\nNo recording yet for today (${notSubmitted.length}): ${names}\n\n` +
-              `_You can still send a make-up for the last 2 days (name it \`name_YYMMDD\`). Two days in a row with nothing = a fine._`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (e) {}
-        }
-
-        // Admin summary including any fines auto-applied.
-        let reportMsg = `📋 *${g.title || 'Group'} - ${today}*\n`;
-        reportMsg += `No recording today: *${notSubmitted.length}*\n`;
-        reportMsg += `Fines applied for ${dayBeforeYesterday}: *${fined.length}*`;
-        if (fined.length > 0) reportMsg += `\n💀 ${fined.join(', ')}`;
-        for (const adminId of ADMIN_IDS) {
-          try {
-            await bot.sendMessage(adminId, reportMsg, { parse_mode: 'Markdown' });
-          } catch (e) {}
+    const assessScope = async (chatId, members) => {
+      const newlyFined = []; // { name, day, total }
+      for (const m of members) {
+        const start = await db.getMemberStartDate(chatId, m.telegram_id);
+        for (const R of due) {
+          if (R < start) continue;                                   // before they joined
+          if (await db.getSubmissionCountForDate(m.telegram_id, chatId, R) > 0) continue; // covered
+          if (await db.penaltyExists(m.telegram_id, chatId, R)) continue;                 // already fined
+          await db.addPenalty(m.telegram_id, chatId, R, 'Missed daily submission');
+          const total = await db.getPenaltyCount(m.telegram_id, chatId);
+          newlyFined.push({ name: formatUserDisplay(m), day: R, total });
         }
       }
+      return newlyFined;
+    };
 
-      // Personal 1:1 scope: finalise fines and send deadline notices.
-      const privateUsers = await db.getPrivateParticipants();
-      for (const u of privateUsers) {
-        await db.assessMissedDay(u.telegram_id, u.telegram_id, dayBeforeYesterday, yesterday);
+    // Groups: announce in the group (unless quiet), batched into one message.
+    for (const g of await db.getAllGroups()) {
+      const members = await db.getScopeMembers(g.chat_id);
+      const fined = await assessScope(g.chat_id, members);
+      if (fined.length === 0) continue;
 
-        if (await db.isQuiet(u.telegram_id)) continue; // quiet: fines still applied, no notice
-        const submittedToday = await db.getSubmissionCountForDate(u.telegram_id, u.telegram_id, today);
-        if (submittedToday > 0) continue;
-        const name = u.first_name || 'there';
+      if (!(await db.isQuiet(g.chat_id))) {
+        let msg = `🚨 *${prefix}Penalties — ${today}*\n\n`;
+        for (const f of fined) msg += `• ${f.name} — missed *${f.day}* (total: ${f.total})\n`;
+        try { await bot.sendMessage(g.chat_id, msg, { parse_mode: 'Markdown' }); } catch (e) {}
+      }
+      for (const adminId of ADMIN_IDS) {
         try {
-          await bot.sendMessage(u.telegram_id,
-            `⛔ *No recording for today yet!*\n\nHey ${name}, you haven't submitted for today.\n\n` +
-            `You can still send a make-up for the last 2 days (name it \`name_YYMMDD\`). ` +
-            `Two days in a row with nothing becomes a fine. 💪`,
-            { parse_mode: 'Markdown' }
-          );
+          await bot.sendMessage(adminId,
+            `🚨 *${g.title || 'Group'}* — ${fined.length} penalty(ies): ${fined.map(f => `${f.name} (${f.day})`).join(', ')}`,
+            { parse_mode: 'Markdown' });
         } catch (e) {}
       }
+    }
+
+    // Private 1:1 scope: assess and DM the user (unless quiet).
+    for (const u of await db.getPrivateParticipants()) {
+      const fined = await assessScope(u.telegram_id, [u]);
+      if (fined.length === 0 || await db.isQuiet(u.telegram_id)) continue;
+      let msg = `🚨 *${prefix}Penalty${fined.length > 1 ? 'ies' : ''}*\n\n`;
+      for (const f of fined) msg += `• Missed *${f.day}* (total: ${f.total})\n`;
+      try { await bot.sendMessage(u.telegram_id, msg, { parse_mode: 'Markdown' }); } catch (e) {}
+    }
+  }
+
+  // Nightly penalty job at 23:59.
+  cron.schedule('59 23 * * *', async () => {
+    try {
+      await runDeadlineCheck();
     } catch (err) {
       console.error('Error in deadline cron:', err.message);
     }
