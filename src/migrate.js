@@ -106,14 +106,18 @@ async function migrate() {
     `);
     console.log('✅ groups table created');
 
-    // Per-chat settings (e.g. quiet mode). Keyed by chat_id (group id or, for a
-    // 1:1 chat, the user's id).
+    // Per-chat settings. Keyed by chat_id (group id or, for a 1:1 chat, the
+    // user's id). `silent` defaults to 0 (OFF): the bot sends notifications until
+    // an admin mutes the chat with /silent on.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chat_settings (
         chat_id BIGINT PRIMARY KEY,
-        quiet INTEGER DEFAULT 0
+        quiet INTEGER DEFAULT 0,
+        silent INTEGER DEFAULT 0
       );
     `);
+    await pool.query(`ALTER TABLE chat_settings ADD COLUMN IF NOT EXISTS silent INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE chat_settings ALTER COLUMN silent SET DEFAULT 0;`);
     console.log('✅ chat_settings table created');
 
     // Which users participate in which group

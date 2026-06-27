@@ -121,17 +121,20 @@ class DatabaseManager {
     return this.queryAll('SELECT * FROM groups WHERE is_active = 1');
   }
 
-  // Quiet mode: when on, the bot doesn't confirm submissions or post the daily
-  // topic in this chat (it still warns about invalid recordings).
-  async isQuiet(chatId) {
-    const row = await this.queryOne('SELECT quiet FROM chat_settings WHERE chat_id = $1', [chatId]);
-    return !!(row && row.quiet === 1);
+  // Silent mode: when ON, the bot sends NO proactive messages in this chat
+  // (confirmations, warnings, daily topic, reminders, penalty announcements).
+  // It STILL records submissions and assesses penalties silently. Default is OFF,
+  // so an unconfigured chat gets notifications until an admin runs /silent on.
+  async isSilent(chatId) {
+    const row = await this.queryOne('SELECT silent FROM chat_settings WHERE chat_id = $1', [chatId]);
+    if (!row || row.silent === null || row.silent === undefined) return false; // default OFF
+    return row.silent === 1;
   }
 
-  async setQuiet(chatId, on) {
+  async setSilent(chatId, on) {
     await this.run(`
-      INSERT INTO chat_settings (chat_id, quiet) VALUES ($1, $2)
-      ON CONFLICT (chat_id) DO UPDATE SET quiet = EXCLUDED.quiet
+      INSERT INTO chat_settings (chat_id, silent) VALUES ($1, $2)
+      ON CONFLICT (chat_id) DO UPDATE SET silent = EXCLUDED.silent
     `, [chatId, on ? 1 : 0]);
   }
 
@@ -175,21 +178,17 @@ class DatabaseManager {
     `);
   }
 
-  // The first day a member is "required" to submit in a scope (no penalties for
-  // days before this). Group → when they joined the group; private → when they
-  // registered. Returns 'YYYY-MM-DD'.
+  // The first day a member is "required" to submit in a scope — their FIRST
+  // recording. No penalties for days before they actually started practising
+  // (so joining the group / lurking never triggers fines). If they've never
+  // submitted, there are no requirements yet → return today. Returns 'YYYY-MM-DD'.
   async getMemberStartDate(chatId, telegramId) {
     const tz = process.env.TIMEZONE || 'Asia/Saigon';
-    if (chatId < 0) {
-      const row = await this.queryOne(
-        'SELECT joined_at FROM group_members WHERE chat_id = $1 AND telegram_id = $2',
-        [chatId, telegramId]
-      );
-      if (row && row.joined_at) return moment(row.joined_at).tz(tz).format('YYYY-MM-DD');
-    } else {
-      const u = await this.queryOne('SELECT registered_at FROM users WHERE telegram_id = $1', [telegramId]);
-      if (u && u.registered_at) return moment(u.registered_at).tz(tz).format('YYYY-MM-DD');
-    }
+    const row = await this.queryOne(
+      'SELECT MIN(submission_date)::text AS d FROM submissions WHERE user_id = $1 AND chat_id = $2 AND is_valid = 1',
+      [telegramId, chatId]
+    );
+    if (row && row.d) return row.d;
     return moment().tz(tz).format('YYYY-MM-DD');
   }
 

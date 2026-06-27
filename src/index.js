@@ -680,7 +680,7 @@ ${isAdmin(userId) ? `
 /check - Check who hasn't submitted
 /addmember - Add a member (reply or user id)
 /removemember - Remove a member
-/quiet - Toggle quiet mode (no submit replies / daily topic)
+/silent - Toggle silent mode (default OFF; /silent on to mute)
 /penalty - Add a penalty
 /forcecheck - Run the end-of-day penalty job now
 /deadline - Set deadline time
@@ -721,7 +721,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 /check - Users who haven't submitted
 /addmember - Add a member (reply to them, or /addmember <user_id>)
 /removemember - Remove a member (reply, or /removemember <user_id>)
-/quiet [on|off] - Mute submit replies & daily topic in this chat
+/silent [on|off] - Silent mode (default OFF); /silent on to mute this chat
 /penalty [user_id] - Add penalty to user
 /forcecheck - Run the end-of-day penalty job now
 /broadcast [message] - Broadcast to all users
@@ -1028,12 +1028,13 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   });
 
-  // Quiet mode (admin): toggle whether the bot confirms submissions and posts the
-  // daily topic in THIS chat. It still warns about invalid/too-short recordings.
-  //   /quiet        → toggle
-  //   /quiet on     → enable quiet mode
-  //   /quiet off    → disable quiet mode
-  bot.onText(/^\/quiet(?:@\w+)?(?:\s+(on|off))?\s*$/i, async (msg, match) => {
+  // Silent mode (admin): the master notification switch for THIS chat. Silent is
+  // OFF by default, so the bot posts notifications. Turn it ON to mute the chat
+  // (it still records submissions and assesses penalties silently).
+  //   /silent        → toggle
+  //   /silent on     → mute this chat
+  //   /silent off    → enable notifications (default)
+  bot.onText(/^\/silent(?:@\w+)?(?:\s+(on|off))?\s*$/i, async (msg, match) => {
     try {
       const chatId = msg.chat.id;
       const userId = msg.from.id;
@@ -1044,20 +1045,21 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
 
       const arg = match[1] ? match[1].toLowerCase() : null;
-      let quiet;
-      if (arg === 'on') quiet = true;
-      else if (arg === 'off') quiet = false;
-      else quiet = !(await db.isQuiet(chatId)); // no arg → toggle
+      let silent;
+      if (arg === 'on') silent = true;
+      else if (arg === 'off') silent = false;
+      else silent = !(await db.isSilent(chatId)); // no arg → toggle
 
-      await db.setQuiet(chatId, quiet);
+      await db.setSilent(chatId, silent);
 
+      // This confirmation is a direct reply to the command, so it always sends.
       await bot.sendMessage(chatId,
-        quiet
-          ? `🔇 *Quiet mode ON.*\nI'll go silent here — no submission confirmations, no daily topic, no reminders, and no penalty announcements.\n\nI'll *still* warn when a recording is too short or unreadable, and fines are *still* applied automatically.\n\n_Turn back on with_ \`/quiet off\``
-          : `🔔 *Quiet mode OFF.*\nI'll confirm submissions and post the daily topic, reminders, and penalty announcements again.`,
+        silent
+          ? `🔇 *Silent mode ON.*\nI won't send any notifications here — no confirmations, warnings, daily topic, reminders, or penalty announcements. I'll keep recording submissions and applying penalties silently.\n\n_Turn notifications on with_ \`/silent off\``
+          : `🔔 *Silent mode OFF.*\nNotifications are now ON for this chat — I'll confirm submissions, warn about invalid recordings, post the daily topic and reminders, and announce penalties.`,
         { parse_mode: 'Markdown' });
     } catch (err) {
-      console.error('Error in /quiet:', err.message);
+      console.error('Error in /silent:', err.message);
     }
   });
 
@@ -1213,10 +1215,14 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         await db.registerGroupMember(chatId, userId);
       }
 
+      // Silent mode (default ON) suppresses ALL proactive messages in this chat —
+      // including invalid-recording warnings. Recording/penalties still happen.
+      const silent = await db.isSilent(chatId);
+
       const validation = validateSubmission(msg);
 
       if (!validation.valid) {
-        if (validation.reason === 'no_media') {
+        if (validation.reason === 'no_media' || silent) {
           return;
         }
         if (validation.reason === 'unknown_duration') {
@@ -1245,8 +1251,6 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         startDate
       );
 
-      const quiet = await db.isQuiet(chatId);
-
       if (result.success) {
         const assignedDate = result.assignedDate;
         const durationStr = validation.duration > 0
@@ -1268,9 +1272,8 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         const user = await db.getUser(userId);
         const userName = formatUserDisplay(user);
 
-        // Quiet mode: record silently (no in-chat confirmation). Admins are still
-        // notified, and invalid/too-short recordings are still warned about above.
-        if (!quiet) {
+        // Silent mode: record without any confirmation in this chat.
+        if (!silent) {
           await bot.sendMessage(chatId,
             `✅ *Submission Recorded!* ${typeEmoji}\n` +
             (isGroup ? `👤 ${userName}\n` : '') +
@@ -1282,8 +1285,10 @@ Just send a voice message, video, or audio file of at least 5 minutes!
           );
         }
 
+        // Admin DMs respect each admin's own silent setting (their 1:1 chat).
         const scopeLine = isGroup ? `\n👥 ${msg.chat.title || 'Group'}` : '\n💬 Private chat';
         for (const adminId of ADMIN_IDS) {
+          if (await db.isSilent(adminId)) continue;
           try {
             await bot.sendMessage(adminId,
               `✅ *Submission Received*\n👤 ${userName}${scopeLine}\n📅 ${assignedDate}${makeupTag}\n⏱ ${durationStr}${streakMsg}`,
@@ -1292,9 +1297,8 @@ Just send a voice message, video, or audio file of at least 5 minutes!
           } catch (e) {}
         }
       } else if (result.discarded) {
-        // Fully caught up — the file isn't needed (no paying ahead). Let them know
-        // (unless quiet) so they don't think it was lost.
-        if (!quiet) {
+        // Fully caught up — the file isn't needed (no paying ahead).
+        if (!silent) {
           await bot.sendMessage(chatId,
             `👍 You're all caught up — no day is owed, so this extra recording isn't needed (you can't bank ahead for future days).`,
             replyOpts);
@@ -1320,7 +1324,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       const groups = await db.getAllGroups();
 
       for (const g of groups) {
-        if (await db.isQuiet(g.chat_id)) continue; // quiet groups get no reminders
+        if (await db.isSilent(g.chat_id)) continue; // quiet groups get no reminders
         const usersStatus = await db.getAllUsersWithTodayStatus(g.chat_id, today);
         const notSubmitted = usersStatus.filter(u => !u.submission_id);
         if (notSubmitted.length === 0) continue;
@@ -1334,6 +1338,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
         } catch (e) {}
 
         for (const adminId of ADMIN_IDS) {
+          if (await db.isSilent(adminId)) continue;
           try {
             await bot.sendMessage(adminId,
               `⏰ *${g.title || 'Group'}* — ${notSubmitted.length} pending\n${names}`,
@@ -1346,7 +1351,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       // Personal 1:1 reminders
       const privateUsers = await db.getPrivateParticipants();
       for (const u of privateUsers) {
-        if (await db.isQuiet(u.telegram_id)) continue;
+        if (await db.isSilent(u.telegram_id)) continue;
         const submittedToday = await db.getSubmissionCountForDate(u.telegram_id, u.telegram_id, today);
         if (submittedToday > 0) continue;
         const name = u.first_name || 'there';
@@ -1409,18 +1414,19 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       return newlyFined;
     };
 
-    // Groups: announce in the group (unless quiet), batched into one message.
+    // Groups: assess always; announce in the group only if it's not silent.
     for (const g of await db.getAllGroups()) {
       const members = await db.getScopeMembers(g.chat_id);
       const fined = await assessScope(g.chat_id, members);
       if (fined.length === 0) continue;
 
-      if (!(await db.isQuiet(g.chat_id))) {
+      if (!(await db.isSilent(g.chat_id))) {
         let msg = `🚨 *${prefix}Penalties — ${today}*\n\n`;
         for (const f of fined) msg += `• ${f.name} — missed *${f.day}* (total: ${f.total})\n`;
         try { await bot.sendMessage(g.chat_id, msg, { parse_mode: 'Markdown' }); } catch (e) {}
       }
       for (const adminId of ADMIN_IDS) {
+        if (await db.isSilent(adminId)) continue;
         try {
           await bot.sendMessage(adminId,
             `🚨 *${g.title || 'Group'}* — ${fined.length} penalty(ies): ${fined.map(f => `${f.name} (${f.day})`).join(', ')}`,
@@ -1429,10 +1435,10 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       }
     }
 
-    // Private 1:1 scope: assess and DM the user (unless quiet).
+    // Private 1:1 scope: assess always; DM the user only if not silent.
     for (const u of await db.getPrivateParticipants()) {
       const fined = await assessScope(u.telegram_id, [u]);
-      if (fined.length === 0 || await db.isQuiet(u.telegram_id)) continue;
+      if (fined.length === 0 || await db.isSilent(u.telegram_id)) continue;
       let msg = `🚨 *${prefix}Penalty${fined.length > 1 ? 'ies' : ''}*\n\n`;
       for (const f of fined) msg += `• Missed *${f.day}* (total: ${f.total})\n`;
       try { await bot.sendMessage(u.telegram_id, msg, { parse_mode: 'Markdown' }); } catch (e) {}
@@ -1471,7 +1477,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
       const groups = await db.getAllGroups();
       for (const g of groups) {
-        if (await db.isQuiet(g.chat_id)) continue; // quiet chats get no daily topic
+        if (await db.isSilent(g.chat_id)) continue; // quiet chats get no daily topic
         try {
           await bot.sendMessage(g.chat_id, fullMessage, { parse_mode: 'Markdown' });
         } catch (e) {}
@@ -1479,7 +1485,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
 
       const privateUsers = await db.getPrivateParticipants();
       for (const u of privateUsers) {
-        if (await db.isQuiet(u.telegram_id)) continue;
+        if (await db.isSilent(u.telegram_id)) continue;
         try {
           await bot.sendMessage(u.telegram_id, fullMessage, { parse_mode: 'Markdown' });
         } catch (e) {}
@@ -1498,6 +1504,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       // Per-group weekly recap
       const groups = await db.getAllGroups();
       for (const g of groups) {
+        if (await db.isSilent(g.chat_id)) continue;
         const members = await db.getScopeMembers(g.chat_id);
         const rows = [];
         for (const u of members) {
@@ -1523,6 +1530,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
       // Personal weekly summary for 1:1 participants
       const privateUsers = await db.getPrivateParticipants();
       for (const u of privateUsers) {
+        if (await db.isSilent(u.telegram_id)) continue;
         const weekSubs = await db.getSubmissionsInRange(u.telegram_id, u.telegram_id, startDate, endDate);
         const streak = await db.calculateStreak(u.telegram_id, u.telegram_id);
         const name = u.first_name || 'there';
