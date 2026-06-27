@@ -1362,20 +1362,25 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }, { timezone: TIMEZONE });
 
-  // Which recording-day(s) hit their deadline at the END of day X.
-  //   • Normal day R → deadline end of R+1, so X-1 is due tonight (unless it's a Saturday).
-  //   • Saturday is special: its recording is deferred to Monday (R+2), so a
-  //     Saturday two days ago (X-2) is due tonight — which only happens on Monday.
-  // (Sun→Mon, all other days → +1.) This yields: nothing due on Sunday night,
-  // and both Sat+Sun due on Monday night.
+  // The deadline DAY for a recording-day R: normally R+1 (the +1 grace day), but
+  // Saturday's recording is deferred to Monday (R+2).
+  function deadlineDay(d) {
+    const dow = moment(d, 'YYYY-MM-DD').day(); // 0=Sun … 6=Sat
+    return moment(d, 'YYYY-MM-DD').add(dow === 6 ? 2 : 1, 'days').format('YYYY-MM-DD');
+  }
+
+  // Recording-days whose grace window has FULLY elapsed as of `today` — i.e. their
+  // deadline day is strictly before today. A day is never penalised while its grace
+  // day is still in progress (so running this mid-day can't penalise prematurely:
+  // on a Saturday it assesses up to Thursday, since Friday's grace is that Saturday).
+  // We scan a short recent window; already-penalised days are skipped by the caller,
+  // so this also back-fills if a nightly run was missed.
   function dueRecordingDays(today) {
-    const dow = d => moment(d, 'YYYY-MM-DD').day(); // 0=Sun … 6=Sat
-    const minus = n => moment(today, 'YYYY-MM-DD').subtract(n, 'days').format('YYYY-MM-DD');
     const due = [];
-    const yesterday = minus(1);
-    if (dow(yesterday) !== 6) due.push(yesterday); // a Saturday is NOT due the next day
-    const twoAgo = minus(2);
-    if (dow(twoAgo) === 6) due.push(twoAgo);       // deferred Saturday comes due (Monday night)
+    for (let n = 1; n <= 5; n++) {
+      const d = moment(today, 'YYYY-MM-DD').subtract(n, 'days').format('YYYY-MM-DD');
+      if (deadlineDay(d) < today) due.push(d); // grace fully over
+    }
     return due;
   }
 
@@ -1385,7 +1390,7 @@ Just send a voice message, video, or audio file of at least 5 minutes!
   async function runDeadlineCheck(catchUp = false) {
     const today = getToday();
     const due = dueRecordingDays(today);
-    if (due.length === 0) return; // e.g. Sunday night — nothing newly due
+    if (due.length === 0) return;
     const prefix = catchUp ? '[catch-up] ' : '';
 
     const assessScope = async (chatId, members) => {
@@ -1434,8 +1439,9 @@ Just send a voice message, video, or audio file of at least 5 minutes!
     }
   }
 
-  // Nightly penalty job at 23:59.
-  cron.schedule('59 23 * * *', async () => {
+  // Penalty job runs just after midnight, so each day's grace window (which ends at
+  // the previous midnight) is fully over before we assess it — no premature fines.
+  cron.schedule('5 0 * * *', async () => {
     try {
       await runDeadlineCheck();
     } catch (err) {
